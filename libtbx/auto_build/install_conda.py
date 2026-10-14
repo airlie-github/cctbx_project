@@ -178,10 +178,7 @@ class conda_manager(object):
     'external': default_file,
     'molprobity': default_file,
     'qrefine': default_file,
-    'phaser': default_file,
-    'voyager': os.path.join('phasertng', 'conda_envs',
-      default_format.format(builder='phasertng', version=version,
-                            platform=conda_platform[platform.system()]))
+    'phaser': default_file
   }
   env_locations['xfel'] = env_locations['labelit'] = env_locations['dials']
   # A set of builders where the environment files do not specify the python

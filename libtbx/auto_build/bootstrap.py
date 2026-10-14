@@ -2203,32 +2203,6 @@ class PhaserBuilder(CCIBuilder):
       configlst.append("--enable_openmp_if_possible=True")
     return configlst
 
-class PhaserTNGBuilder(PhaserBuilder):
-  CODEBASES = PhaserBuilder.CODEBASES + ['phasertng', 'phaser_voyager', 'voyager_regression']
-  LIBTBX = PhaserBuilder.LIBTBX + ['phasertng', 'phaser_voyager', 'voyager_regression']
-
-  def add_tests(self):
-    self.add_test_parallel(module='voyager_regression') # run voyager_regression/run_tests.py file
-    self.add_test_parallel(module='phaser_regression') # run phaser_regression/run_tests.py file
-
-  def get_libtbx_configure(self):
-    configlst = super(PhaserTNGBuilder, self).get_libtbx_configure()
-    if not self.isPlatformMacOSX():
-      configlst.append("--enable_openmp_if_possible=True")
-    return configlst
-
-  def get_codebases(self):
-    """
-    Phaser uses Boost in the conda environment for Python 3 and Windows
-    """
-    codebases = super(PhaserTNGBuilder, self).get_codebases()
-    if (self.python3 and self.use_conda is not None):
-      try:
-        codebases.remove('boost')
-      except ValueError:
-        pass
-    return codebases
-
 class CCTBXLiteBuilder(CCIBuilder):
   BASE_PACKAGES = 'cctbx'
     # Checkout these codebases
@@ -2894,8 +2868,7 @@ def run(root=None):
     'external': PhenixExternalRegression,
     'molprobity':MOLPROBITYBuilder,
     'qrefine': QRBuilder,
-    'phaser': PhaserBuilder,
-    'voyager': PhaserTNGBuilder
+    'phaser': PhaserBuilder
   }
 
   wrapper = textwrap.TextWrapper(width=80, initial_indent='  ',
