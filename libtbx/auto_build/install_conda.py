@@ -163,7 +163,6 @@ class conda_manager(object):
     'phenix': phenix_env,
     'phenix_discamb': phenix_env,
     'phenix_molstar': phenix_env,
-    'phenix_voyager': phenix_env,
     'phenix_release': phenix_env,
     'xfellegacy': default_file,
     'dials-old': os.path.join('dials', '.conda-envs',

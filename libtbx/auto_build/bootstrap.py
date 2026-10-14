@@ -2859,7 +2859,6 @@ def run(root=None):
     'phenix': PhenixBuilder,
     'phenix_discamb': PhenixDiscambBuilder,
     'phenix_molstar': PhenixMolstarBuilder,
-    'phenix_voyager': PhenixBuilder,
     'phenix_release': PhenixReleaseBuilder,
     'xfellegacy': XFELLegacyBuilder,
     'xfel': XFELBuilder,
