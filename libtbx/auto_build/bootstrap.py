@@ -1005,6 +1005,12 @@ class phasertng_regression_module(SourceModule):
                'git@gitlab.developers.cam.ac.uk:scm/haematology/readgroup/phasertng_regression.git',
                'https://gitlab.developers.cam.ac.uk/scm/haematology/readgroup/phasertng_regression.git']
 
+class phasertng_data_module(SourceModule):
+  module = 'phasertng_data'
+  anonymous = ['git',
+               'git@gitlab.developers.cam.ac.uk:scm/haematology/readgroup/phasertng_data.git',
+               'https://gitlab.developers.cam.ac.uk/scm/haematology/readgroup/phasertng_data.git']
+
 # DIALS repositories
 class labelit_module(SourceModule):
   module = 'labelit'
@@ -1433,7 +1439,7 @@ class Builder(object):
       raise Exception('Unknown access method: %s %s'%(method, str(parameters)))
 
     # add git-lfs steps if needed (should move into Toolbox class)
-    git_lfs_modules = ['phenix_examples', 'phenix_regression', 'chem_data', 'phasertng']
+    git_lfs_modules = ['phenix_examples', 'phenix_regression', 'chem_data', 'phasertng', 'phasertng_data']
     if module in git_lfs_modules:
       # prepend path for check
       dev_env = os.path.join('.', 'dev_env', 'bin')
@@ -2593,6 +2599,11 @@ class PhenixMolstarBuilder(PhenixBuilder):
         description='molstar adaptbx install script',
       ))
 
+class VoyagerBuilder(PhenixBuilder):
+  # phenix with the isostructure data module of phasertng, filled afterwards by phasertng.isostructure_data
+  CODEBASES_EXTRA = PhenixBuilder.CODEBASES_EXTRA + ['phasertng_data']
+  LIBTBX_EXTRA = PhenixBuilder.LIBTBX_EXTRA + ['phasertng_data']
+
 class PhenixExternalRegression(PhenixBuilder):
   EXTERNAL_CODEBASES = [
     "afitt",
@@ -2875,7 +2886,8 @@ def run(root=None):
     'external': PhenixExternalRegression,
     'molprobity':MOLPROBITYBuilder,
     'qrefine': QRBuilder,
-    'phaser': PhaserBuilder
+    'phaser': PhaserBuilder,
+    'voyager': VoyagerBuilder
   }
 
   wrapper = textwrap.TextWrapper(width=80, initial_indent='  ',
