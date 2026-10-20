@@ -2438,6 +2438,7 @@ class PhenixBuilder(CCIBuilder):
     'king',
     'phaser',
     'phasertng',
+    'phasertng_data',
     'phasertng_regression',
     'phaser_regression',
     'voyager_regression',
@@ -2460,6 +2461,7 @@ class PhenixBuilder(CCIBuilder):
     'reel',
     'phaser',
     'phasertng',
+    'phasertng_data',
     'phasertng_regression',
     'phaser_regression',
     'voyager_regression',
@@ -2600,9 +2602,15 @@ class PhenixMolstarBuilder(PhenixBuilder):
       ))
 
 class VoyagerBuilder(PhenixBuilder):
-  # phenix with the isostructure data module of phasertng, filled afterwards by phasertng.isostructure_data
-  CODEBASES_EXTRA = PhenixBuilder.CODEBASES_EXTRA + ['phasertng_data']
-  LIBTBX_EXTRA = PhenixBuilder.LIBTBX_EXTRA + ['phasertng_data']
+  # phenix, then the isostructure library of phasertng_data built last, as it takes hours
+  def add_refresh(self):
+    super(VoyagerBuilder, self).add_refresh()
+    self.add_command(
+      'phasertng.isostructure_data',
+      args=["isostructure_data.nproc=%s" % self.nproc],
+      name='phasertng.isostructure_data',
+      workdir=['.'],
+    )
 
 class PhenixExternalRegression(PhenixBuilder):
   EXTERNAL_CODEBASES = [
