@@ -1,13 +1,34 @@
 """GuidedCoding auto queue: one controller, one worker, one queue record.
 
 State, stop flag, tracked command runs, the local run lock, reconciliation
-and the morning report for `/gc auto`. Standard library only. No scheduler
+and the morning report for `/gc auto`. Standard library and psutil. No scheduler
 and no worker pool. Interface: AUTO_QUEUE_SPEC, including Revisions 2-8
 (record 2026-10-08-gc-auto-release-plan/stage1).
+Revision 12: `run` refuses on any system other than macOS; `init` needs --lock-dir.
+Revision 13: an unreadable process table refuses (exit 17) instead of reading as empty;
+`transfer` hands jobs to an attended record (final state Transferred); `install check` can
+classify timestamp-only differences from a NORMALIZED value (report-only, never available).
+Revision 14: a zombie (an exited process its parent has not collected, as in a container
+whose process 1 never reaps) counts as gone everywhere liveness is decided.
+Revision 16: the process table is read through psutil instead of /bin/ps, with the same
+refusals; without psutil every command stops (exit 18).
+Revision 18: any Python 3.10 or newer that has psutil runs it (an older Python refuses, exit 19),
+for example a venv's bin/python with psutil installed there, or libtbx.python.
 
-Stop from any Terminal, without the coding conversation:
-    python3 <procedure root>/auto_queue.py stop
+Stop from any Terminal, without the coding conversation, with both paths absolute, exactly as the
+auto-mode start screen prints them (`screen_check.py stop-command` gives the interpreter that
+runs the kit):
+    /ABS/<interpreter> -I -B /ABS/<procedure root>/auto_queue.py stop
 """
+
+import sys
+
+# Revision 18: the kit needs Python 3.10 or newer; an older Python refuses here, before
+# anything else runs, with exit 19 (the same message and code in every tool).
+if sys.version_info < (3, 10):
+    sys.stderr.write("REFUSED: requires Python 3.10 or newer; this is Python %d.%d.%d (%s)\n"
+                     % (tuple(sys.version_info[:3]) + (sys.executable,)))
+    sys.exit(19)
 
 import argparse
 import calendar
@@ -25,8 +46,13 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import psutil
+except ImportError:  # Revision 16: main() stops with PSUTIL_MESSAGE (exit 18)
+    psutil = None
+
 STATES = ("Queued", "Preparing", "Testing", "Ready for approval", "Approved",
-          "Waiting", "Blocked", "Discarded", "Published")
+          "Waiting", "Blocked", "Discarded", "Published", "Transferred")
 TRANSITIONS = {
     "Queued": ("Preparing", "Blocked", "Discarded"),
     "Preparing": ("Testing", "Blocked", "Waiting", "Discarded"),
@@ -37,13 +63,29 @@ TRANSITIONS = {
     "Approved": ("Published", "Preparing", "Discarded"),
     "Published": (),
     "Discarded": (),
+    # Revision 13: reached only through `transfer` (auto -> attended); final, never reopened:
+    # the successor record owns the work from then on.
+    "Transferred": (),
 }
 ACTIVE_STATES = ("Queued", "Preparing", "Testing", "Waiting")
-FINAL_STATES = ("Published", "Discarded")
-DEFAULT_LOCK = "/Users/terwill/unix/PHENIX/gc_test/RUN.lock"
-# Start times are read the same way whatever the caller's TZ, locale or PATH.
-PS = "/bin/ps"
-PS_ENV = {"LC_ALL": "C", "TZ": "UTC", "PATH": "/bin:/usr/bin"}
+FINAL_STATES = ("Published", "Discarded", "Transferred")
+# Revision 12: `run` needs macOS (sandbox-exec for the network block, `ps -E` for the run-id
+# marker; Revision 16: psutil reads the marker, the message is unchanged); elsewhere it
+# refuses with this exit code. Nothing but sys.platform decides it.
+PLATFORM_REFUSED = 15
+# Revision 13: the process table could not be read (Revision 16: psutil could not list the
+# processes or read a field a decision needs, or left out this process): every command that
+# needs it refuses with this code.
+PROCESS_TABLE_UNREADABLE = 17
+# Revision 16: psutil is required (the process table); without it every command stops.
+PSUTIL_MISSING = 18
+# Revision 18: the message names the install command for the Python that runs the helper
+# (a path that needs it in single quotes, as screen_check.py stop-command writes it).
+PSUTIL_MESSAGE = ("requires psutil, which %s does not have: make a venv and install it there "
+                  "(python3 -m venv DIR, then DIR/bin/python -m pip install psutil; not --user, "
+                  "which the kit's -I ignores), then run with DIR/bin/python; or use libtbx.python"
+                  % (sys.executable if re.fullmatch(r"[A-Za-z0-9_./+@%:,=-]+", sys.executable or "")
+                     else "'%s'" % sys.executable))
 UNREADABLE = "unreadable"
 SCREEN_CHECK = Path(__file__).resolve().parent / "payload" / "tools" / "screen_check.py"
 MARKER = "GC_AUTO_RUN_ID"
@@ -60,6 +102,11 @@ class Refused(Exception):
     def __init__(self, code, message):
         Exception.__init__(self, message)
         self.code = code
+
+
+def platform_supported():
+    """Revision 12: auto-mode runs need macOS. Reads sys.platform only; there is no switch."""
+    return sys.platform == "darwin"
 
 
 def now():
@@ -103,14 +150,347 @@ def read_json(path):
 
 # ---------------------------------------------------------------- processes
 
+# Revision 16: the process table is read through psutil, never /bin/ps (whose setuid binary
+# is refused inside sandbox-exec). psutil reads the same kernel records ps read (macOS:
+# sysctl KERN_PROC and KERN_PROCARGS2; Linux: /proc). It gives no process-group or session
+# id, so those come from os.getpgid and os.getsid, as the session id always did. macOS
+# refuses getpgid (ESRCH) for a process that is exiting or a zombie; its group id is then
+# read from the kernel record that ps read (kernel_pgid). Every field a decision needs fails
+# closed (Revision 13): AccessDenied and ZombieProcess on such a field make the table
+# unreadable (exit 17); NoSuchProcess means the process is gone only once a re-check finds
+# it gone.
+ZOMBIE = "zombie"  # psutil.STATUS_ZOMBIE
+START_FORMAT = "%a %b %d %H:%M:%S %Y"  # the text form of a start time (that of ps lstart)
+# Repair 1 (reading 1, finding 2): any exception while reading a process counts as a failed
+# reading (none of these sites can raise a refusal): on the whole table it makes the table
+# unreadable (17); on one process's field that field is unreadable (the process alive).
+PSUTIL_ERRORS = (Exception,)
+
+
+def start_text(seconds):
+    """A start time in whole UTC seconds as ps lstart printed it (C asctime, LC_ALL=C TZ=UTC),
+    so that records written by earlier revisions compare equal."""
+    return time.asctime(time.gmtime(seconds))
+
+
+def start_seconds(process):
+    """Whole seconds of the start time, truncated as ps truncated it. Repair 2 (reading 2,
+    finding 1): on macOS the raw kernel start time (kinfo_proc p_starttime, what ps printed),
+    because psutil's create_time() there is shifted by whole seconds after a clock step,
+    differently in processes that imported psutil before and after it. On Linux psutil's
+    value: start ticks plus the boot time read at each call, the formula of procps."""
+    if sys.platform == "darwin":
+        return kernel_start(process.pid)
+    return int(process.create_time())
+
+
+def proc_state(pid):
+    """(status, number of threads or None) of PID; ("", None) when the status cannot be read.
+    The thread count is read on Linux only (the macOS rule needs none, and macOS lets psutil
+    read it only for this user's processes); an unreadable count is None."""
+    try:
+        process = psutil.Process(pid)
+        state = process.status()
+    except PSUTIL_ERRORS:
+        return "", None
+    threads = None
+    if sys.platform.startswith("linux"):
+        try:
+            threads = process.num_threads()
+        except PSUTIL_ERRORS:
+            threads = None
+    return state, threads
+
+
+def zombie_gone(pid, state=None):
+    """Revision 14: True only for a positive reading that PID is a zombie: a process that has
+    exited and only waits for its parent to collect it (in a container whose process 1 never
+    does, forever). Such a process runs nothing and counts as gone wherever liveness is
+    decided. Everything else counts as alive, including any state that cannot be read.
+    A zombie status is not enough on Linux: there the leader of a multi-threaded process
+    whose main thread has exited also shows Z while its other threads run. So on Linux the
+    process must also be single-threaded (status zombie and num_threads 1, both from
+    /proc/<pid>/stat through psutil); an unknown thread count counts as alive. On macOS a
+    zombie status is enough: there a process with a running thread never shows Z. STATE is
+    the psutil status when the caller has already read it (macOS uses it as is)."""
+    if sys.platform == "darwin":
+        if state is None:
+            state = proc_state(pid)[0]
+        return state == ZOMBIE
+    if state is not None and state != ZOMBIE:
+        return False
+    state, threads = proc_state(pid)
+    return state == ZOMBIE and threads == 1
+
+
+_KINFO = {}
+
+
+def kinfo_raw(pid):
+    """macOS: the 648-byte kernel record of PID (sysctl CTL_KERN, KERN_PROC, KERN_PROC_PID:
+    struct kinfo_proc), or None when it cannot be read."""
+    import ctypes
+    if "sysctl" not in _KINFO:
+        sysctl = ctypes.CDLL(None, use_errno=True).sysctl
+        sysctl.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+        sysctl.restype = ctypes.c_int
+        _KINFO["sysctl"] = sysctl
+    mib = (ctypes.c_int * 4)(1, 14, 1, int(pid))
+    buf, size = ctypes.create_string_buffer(648), ctypes.c_size_t(648)
+    if _KINFO["sysctl"](mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value != 648:
+        return None
+    return buf.raw
+
+
+def kinfo_record(pid):
+    """macOS: (p_pid, e_ppid, e_pgid) of PID from its kernel record (p_pid at 40, e_ppid at
+    560, e_pgid at 564), or None when it cannot be read."""
+    raw = kinfo_raw(pid)
+    if raw is None:
+        return None
+    return tuple(int.from_bytes(raw[at:at + 4], "little", signed=True) for at in (40, 560, 564))
+
+
+def kernel_start(pid):
+    """macOS, repair 2: whole seconds of PID's start time from its kernel record
+    (kp_proc.p_starttime.tv_sec, at offset 0), what ps lstart printed, read only after the
+    layout check (kinfo_layout_ok) and only from a record whose p_pid is PID. Raises
+    psutil.NoSuchProcess when there is no record and the process is gone, otherwise an error
+    (the start time is then unreadable: fail closed)."""
+    if not kinfo_layout_ok():
+        raise RuntimeError("kernel record layout not confirmed")
+    raw = kinfo_raw(pid)
+    if raw is None:
+        if not psutil.pid_exists(pid):
+            raise psutil.NoSuchProcess(pid)
+        raise RuntimeError("no kernel record for process %d" % pid)
+    if int.from_bytes(raw[40:44], "little", signed=True) != pid:
+        raise RuntimeError("kernel record of another process")
+    seconds = int.from_bytes(raw[0:8], "little", signed=True)
+    if seconds <= 0:
+        raise RuntimeError("no start time in the kernel record of process %d" % pid)
+    return seconds
+
+
+def kinfo_layout_ok():
+    """Repair 1 (finding 9), repair 2: the kinfo_proc layout is trusted only when the record of
+    a process whose parent and group differ (so that the two offsets cannot be confused)
+    names that process, its parent and its group: this process when its own parent and group
+    differ (getppid, getpgid), else a short-lived child started in its own session (its
+    parent is this process, its group itself: this Python running a one-line program that
+    waits for the end of a pipe, so no outside program is needed; repair 3). The start time at
+    offset 0 of this process's record must also be a time in the past, after 2001. Any
+    failure: False, so the group and (macOS) the start time of processes read from the record
+    are unreadable: fail closed. Checked once per helper process."""
+    if "layout" not in _KINFO:
+        ok = False
+        try:
+            me, parent, group = os.getpid(), os.getppid(), os.getpgid(0)
+            if parent != group:
+                ok = kinfo_record(me) == (me, parent, group)
+            else:
+                child = subprocess.Popen([sys.executable, "-I", "-S", "-c",
+                                          "import sys; sys.stdin.read()"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         start_new_session=True)
+                try:
+                    ok = kinfo_record(child.pid) == (child.pid, me, child.pid)
+                finally:
+                    child.stdin.close()
+                    try:
+                        child.wait(5)
+                    except subprocess.TimeoutExpired:
+                        # Repair 3 (reading 3, finding 1): a child that does not end at the end
+                        # of its pipe is killed and reaped; the check then fails (closed).
+                        ok = False
+                        child.kill()
+                        child.wait()
+            if ok:
+                own = kinfo_raw(me)
+                started = int.from_bytes(own[0:8], "little", signed=True) if own else 0
+                ok = 978307200 <= started <= time.time() + 1
+        except Exception:
+            ok = False
+        _KINFO["layout"] = ok
+    return _KINFO["layout"]
+
+
+def kernel_pgid(pid):
+    """macOS: the process-group id of PID from its kernel record (kinfo_record), the record ps
+    read, for a process whose group getpgid refuses: one that is exiting (still running or
+    idle, not yet a zombie) or a zombie. None when it cannot be read or the layout check
+    (kinfo_layout_ok) fails, and always off macOS."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        if not kinfo_layout_ok():
+            return None
+        found = kinfo_record(pid)
+    except Exception:
+        return None
+    if found is None or found[0] != pid or found[2] <= 0:
+        return None
+    return found[2]
+
+
+def environment_marks(process):
+    """Run ids in a process's visible command line and environment, read as `ps -E -ww`
+    printed them (the command, then NAME=value words): the same pattern on the same text.
+    Raises psutil errors when neither can be read."""
+    words = []
+    readable = False
+    try:
+        words.extend(process.cmdline())
+        readable = True
+    except PSUTIL_ERRORS:
+        pass
+    try:
+        environ = process.environ()
+    except PSUTIL_ERRORS:
+        if not readable:
+            raise
+    else:
+        words.extend("%s=%s" % item for item in environ.items())
+    return set(re.findall(r"\b%s=(\S+)" % MARKER, " ".join(words)))
+
+
+def gone(error):
+    """True for psutil's NoSuchProcess, which the caller re-checks before it counts the
+    process as gone. ZombieProcess is a subclass of NoSuchProcess in psutil, but it is a
+    process that exists unread: never gone."""
+    return isinstance(error, psutil.NoSuchProcess) and not isinstance(error, psutil.ZombieProcess)
+
+
+def needed(read, what, pid):
+    """A field a decision needs: AccessDenied or ZombieProcess (or any other failure but
+    NoSuchProcess, which the caller re-checks) makes the table unreadable."""
+    try:
+        return read()
+    except PSUTIL_ERRORS as error:
+        if gone(error):
+            raise
+        raise ProcessTableUnreadable("cannot read %s of process %d: %s"
+                                     % (what, pid, type(error).__name__))
+
+
+def read_entry(pid, markers):
+    """One process: {ppid, pgid, sid, state, start, marks, zombie}. Raises psutil.NoSuchProcess
+    when it is gone, ProcessTableUnreadable when a needed field cannot be read."""
+    process = needed(lambda: psutil.Process(pid), "the record", pid)
+    with process.oneshot():
+        state = needed(process.status, "the status", pid)
+        ppid = needed(process.ppid, "the parent", pid)
+        zombie = state == ZOMBIE and zombie_gone(pid, state)
+        try:
+            start = start_seconds(process)
+        except PSUTIL_ERRORS as error:
+            if gone(error):
+                raise
+            if not zombie:
+                raise ProcessTableUnreadable("cannot read the start time of process %d: %s"
+                                             % (pid, type(error).__name__))
+            start = None  # a zombie whose start time cannot be read is kept with None
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            # macOS refuses getpgid for a process that is exiting or a zombie: the kernel
+            # record still has the group. Otherwise (or when that cannot be read either) the
+            # process may be gone: read_table re-checks and, while it exists, reads it again.
+            pgid = kernel_pgid(pid)
+            if pgid is None:
+                raise psutil.NoSuchProcess(pid)
+        except Exception as error:
+            raise ProcessTableUnreadable("cannot read the group of process %d: %s" % (pid, error))
+        try:
+            sid = os.getsid(pid)
+        except Exception:
+            sid = None
+        marks = set()
+        if markers and pid == os.getpid():
+            # Checkpoint 3, repair 1 (reading 1, finding 1): this process's own environment
+            # must be readable, whatever its command line shows, and must show its own run-id
+            # marker when it has one; otherwise markers may be missing: unreadable (17).
+            environ = needed(process.environ, "the environment", pid)
+            if os.environ.get(MARKER) and environ.get(MARKER) != os.environ[MARKER]:
+                raise ProcessTableUnreadable("the environment of this process (%d) does not "
+                                             "show its run-id marker" % pid)
+            marks = environment_marks(process)
+        elif markers and not zombie:
+            try:
+                marks = environment_marks(process)
+            except PSUTIL_ERRORS as error:
+                if gone(error):
+                    raise
+                # As `ps -E`, which shows no environment for another user's process.
+    return {"ppid": ppid, "pgid": pgid, "sid": sid, "state": state, "start": start,
+            "marks": marks, "zombie": bool(zombie)}
+
+
+def read_table(markers=False):
+    """Every process: pid -> read_entry(). Revision 13, fails closed: raises
+    ProcessTableUnreadable when the process list cannot be read, a needed field of a listed
+    process cannot be read, a listed process vanishes (or, on macOS, its group cannot be read
+    because it exited meanwhile) but a re-check still finds it, twice, or the table leaves out
+    this process. A process that vanished counts as gone only when
+    the re-check (psutil.pid_exists) also finds it gone. Process 0 (the macOS kernel task,
+    which ps -ax never listed) is left out."""
+    try:
+        pids = psutil.pids()
+    except PSUTIL_ERRORS as error:
+        raise ProcessTableUnreadable("psutil could not list processes: %s" % error)
+    table = {}
+    for pid in pids:
+        if pid <= 0:
+            continue
+        for attempt in (1, 2):
+            try:
+                table[pid] = read_entry(pid, markers)
+                break
+            except ProcessTableUnreadable:
+                raise
+            except Exception as error:
+                # Repair 1 (finding 2): an unexpected failure anywhere in the reading of one
+                # process (for example inside psutil's oneshot()) makes the table unreadable;
+                # NoSuchProcess alone (gone()) is re-checked below.
+                if not gone(error):
+                    raise ProcessTableUnreadable("cannot read process %d: %s"
+                                                 % (pid, type(error).__name__))
+                try:
+                    exists = psutil.pid_exists(pid)
+                except PSUTIL_ERRORS:
+                    exists = True
+                if not exists:
+                    break
+                if attempt == 2:
+                    raise ProcessTableUnreadable("process %d could not be read completely "
+                                                 "(twice), but still exists" % pid)
+    if os.getpid() not in table:
+        raise ProcessTableUnreadable("psutil listed %d process(es) but not this one (%d)"
+                                     % (len(table), os.getpid()))
+    return table
+
+
+def group_states(pgid):
+    """(pid, status) of the members of process group PGID, or None when the table cannot be
+    read."""
+    try:
+        table = read_table()
+    except ProcessTableUnreadable:
+        return None
+    return [(pid, entry["state"]) for pid, entry in sorted(table.items())
+            if entry["pgid"] == pgid]
+
+
 def process_exists(pid):
+    """True while PID is a process that has not exited. Revision 14: a zombie is gone."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
-    return True
+        pass
+    return not zombie_gone(pid)
 
 
 def process_start(pid):
@@ -118,12 +498,11 @@ def process_start(pid):
     if not pid or not process_exists(pid):
         return None
     try:
-        out = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], env=PS_ENV,
-                             capture_output=True, text=True)
-        text = out.stdout.strip()
-    except OSError:
+        text = start_text(start_seconds(psutil.Process(pid)))
+    except PSUTIL_ERRORS:
         text = ""
-    if text:
+    # Revision 13: only a start time that parses counts; anything else is unreadable.
+    if text and epoch(text, START_FORMAT) is not None:
         return text
     return UNREADABLE if process_exists(pid) else None
 
@@ -139,6 +518,9 @@ def same_process(pid, recorded_start):
 
 
 def group_alive(pgid):
+    """True while process group PGID has a member that has not exited. Revision 14: a group
+    whose only members are zombies is gone (macOS then answers killpg with EPERM, Linux with
+    success). An unreadable table keeps the group alive."""
     if not pgid:
         return False
     try:
@@ -146,8 +528,20 @@ def group_alive(pgid):
     except ProcessLookupError:
         return False
     except PermissionError:
+        pass
+    states = group_states(pgid)
+    if states is None:
         return True
-    return True
+    if not states:
+        # Every member left between the two reads, or the table does not list them: ask again.
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    return not all(zombie_gone(pid, state) for pid, state in states)
 
 
 _SNAPSHOT = {"time": 0.0, "procs": None}
@@ -160,34 +554,50 @@ def epoch(text, fmt):
         return None
 
 
+class ProcessTableUnreadable(Refused):
+    """Revision 13: the process table could not be read, so whether a process is alive is
+    unknown. Every caller refuses or reports unknown; none treats it as an empty table."""
+
+    def __init__(self, why):
+        Refused.__init__(self, PROCESS_TABLE_UNREADABLE,
+                         "cannot read the process table (%s); whether queue processes are alive "
+                         "is unknown" % why)
+
+
 def snapshot():
-    """All processes: pid -> (ppid, pgid, sid, start epoch, run ids in the environment)."""
+    """All processes: pid -> [ppid, pgid, sid, start epoch, run ids in the environment, zombie].
+    Revision 14: a zombie (zombie_gone) stays in the table with its flag set, so that a
+    recorded leader id is still compared with its start time (leaders_of); it counts as gone
+    for liveness (live_table, survivors). A zombie whose start time cannot be read is kept
+    with start None.
+    Revision 13: fails closed (read_table); nothing is cached then. Revision 16: the run-id
+    markers are read on macOS only, as before (Linux ps had no -E, so off macOS there were
+    none); there this process's own environment must be readable (Checkpoint 3), and another
+    process whose environment cannot be read shows none, as with `ps -E`."""
     if _SNAPSHOT["procs"] is not None and time.time() - _SNAPSHOT["time"] < 0.3:
         return _SNAPSHOT["procs"]
-    procs = {}
-    try:
-        out = subprocess.run([PS, "-ax", "-o", "pid=,ppid=,pgid=,lstart="], env=PS_ENV,
-                             capture_output=True, text=True).stdout
-        marks = subprocess.run([PS, "-E", "-ww", "-ax", "-o", "pid=,command="], env=PS_ENV,
-                               capture_output=True, text=True).stdout
-    except OSError:
-        out, marks = "", ""
-    for line in out.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) < 4:
-            continue
-        pid, ppid, pgid = int(fields[0]), int(fields[1]), int(fields[2])
-        try:
-            sid = os.getsid(pid)
-        except OSError:
-            sid = None
-        procs[pid] = [ppid, pgid, sid, epoch(fields[3], "%a %b %d %H:%M:%S %Y"), set()]
-    for line in marks.splitlines():
-        fields = line.split(None, 1)
-        if len(fields) == 2 and fields[0].isdigit() and int(fields[0]) in procs:
-            procs[int(fields[0])][4].update(re.findall(r"\b%s=(\S+)" % MARKER, fields[1]))
+    table = read_table(markers=sys.platform == "darwin")
+    procs = {pid: [entry["ppid"], entry["pgid"], entry["sid"], entry["start"], entry["marks"],
+                   entry["zombie"]] for pid, entry in table.items()}
     _SNAPSHOT.update(time=time.time(), procs=procs)
     return procs
+
+
+def live_table(procs):
+    """Revision 14: the table without zombies (None stays None), for every liveness decision."""
+    if procs is None:
+        return None
+    return {pid: entry for pid, entry in procs.items() if not (len(entry) > 5 and entry[5])}
+
+
+def snapshot_or_none():
+    """For a run's own bookkeeping while its command runs: the table, or None when it is
+    unreadable (the caller then signals by group only and records the gap; it never
+    concludes that nothing is left)."""
+    try:
+        return snapshot()
+    except ProcessTableUnreadable:
+        return None
 
 
 def leaders_of(record, procs):
@@ -199,7 +609,8 @@ def leaders_of(record, procs):
             continue
         recorded = epoch(record.get(start_key) or "", "%a %b %d %H:%M:%S %Y")
         live = procs.get(leader)
-        # A live leader with another start time means the id was reused: not ours.
+        # A leader with another start time means the id was reused: not ours. Revision 14:
+        # this includes a zombie (still in the table) that holds the id.
         if live is not None and (recorded is None or live[3] is None or live[3] != recorded):
             continue
         leaders.add(leader)
@@ -217,29 +628,33 @@ def survivors(record):
     ended = epoch(record.get("ended", ""), "%Y-%m-%dT%H:%M:%SZ")
 
     def during(start):
-        # Both times are whole UTC seconds, truncated the same way: a process that started
-        # while the run ran cannot have a later second than `ended` or an earlier one than
-        # `started`, so the window is exact to the second.
-        return (start is not None and (started is None or start >= started)
+        # Both times are whole UTC seconds: a process that started while the run ran cannot
+        # have a later second than `ended`. Revision 12 (P10): the earlier bound allows one
+        # second (`started` - 1), as the descendant rule below does, because Linux ps can
+        # report a start time up to 1 s early (Revision 16: psutil, which reads the same
+        # clock ticks, too); every other identity check still applies.
+        return (start is not None and (started is None or start >= started - 1)
                 and (ended is None or start <= ended))
 
     probe_start = epoch(record.get("probe_started", ""), "%Y-%m-%dT%H:%M:%SZ")
     probe_end = epoch(record.get("probe_ended", ""), "%Y-%m-%dT%H:%M:%SZ")
 
     def during_probe(start):
-        return (start is not None and (probe_start is None or start >= probe_start)
+        # The same one-second allowance on the earlier bound (Revision 12, P10).
+        return (start is not None and (probe_start is None or start >= probe_start - 1)
                 and (probe_end is None or start <= probe_end))
 
+    leaders = leaders_of(record, procs)  # Revision 14: with zombies, for the start-time check
+    procs = live_table(procs)  # then only processes that have not exited
     found = set()
     for item in record.get("tracked", []):
         live = procs.get(item.get("pid"))
         if live is not None and live[3] is not None and live[3] == item.get("start"):
             found.add(item["pid"])
-    leaders = leaders_of(record, procs)
     probe_leader = record.get("probe_pgid") if record.get("probe_pgid") in leaders else None
     roots = {1, wrapper} | leaders
     marked = set()
-    for pid, (ppid, pgid, sid, start, marks) in procs.items():
+    for pid, (ppid, pgid, sid, start, marks) in ((p, e[:5]) for p, e in procs.items()):
         if pid in (me, wrapper) or not during(start):
             continue
         if record["run_id"] in marks:
@@ -270,6 +685,17 @@ def survivors(record):
         found |= more
         grew = bool(more)
     return sorted(found)
+
+
+def survivors_or_unknown(record):
+    """survivors(record), or None when the process table is unreadable (Revision 13)."""
+    try:
+        return survivors(record)
+    except ProcessTableUnreadable:
+        return None
+
+
+UNKNOWN_LEFT = "unknown (process table unreadable)"
 
 
 def run_live(record):
@@ -417,6 +843,7 @@ class Queue:
                     if r.get("label") == label and r.get("status") == "completed"
                     and r.get("exit_code") == 0 and not r.get("stale")
                     and not r.get("group_left_running")
+                    and not r.get("process_table_unreadable")
                     and r.get("candidate_id") == job["candidate_id"]
                     and r.get("criterion_sha256") == job["criterion_sha256"]
                     and r.get("tested_paths")
@@ -515,6 +942,10 @@ def free_gib(path):
 # ---------------------------------------------------------------- commands
 
 def cmd_init(args):
+    if not args.lock_dir:
+        # Revision 12: no default lock; nothing is created or changed without one.
+        raise Refused(2, "init needs --lock-dir: give the lock directory from the project "
+                         "method's lock directory")
     previous = active_dir(args)
     if previous and not Queue(previous).finished():
         raise Refused(8, "active queue %s is not finished" % previous)
@@ -549,7 +980,7 @@ def cmd_init(args):
     data = {
         "queue_id": args.queue_id,
         "created": now(),
-        "lock_dir": str(Path(args.lock_dir or DEFAULT_LOCK).resolve()),
+        "lock_dir": str(Path(args.lock_dir).resolve()),
         "min_free_gib": args.min_free_gib,
         "space_path": str(Path(args.space_path).resolve()) if args.space_path else str(directory),
         "allowed_roots": [str(Path(r).resolve()) for r in (args.allowed_root or [])],
@@ -582,6 +1013,8 @@ def cmd_set(args):
     queue = open_queue(args)
     if args.state not in STATES:
         raise Refused(2, "unknown state %r" % args.state)
+    if args.state == "Transferred":
+        raise Refused(2, "a job is transferred only with `transfer JOB --to DIR --note TEXT`")
     with queue.locked():
         job = queue.job(args.job)
         if queue.stop_requested() and args.state not in ("Blocked", "Waiting"):
@@ -691,8 +1124,13 @@ def cmd_candidate(args):
 
 
 def git_rev(repo, rev):
-    out = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", rev],
-                         capture_output=True, text=True)
+    # Revision 16: without git on PATH this refuses (2) with the cause, not a traceback.
+    try:
+        out = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", rev],
+                             capture_output=True, text=True)
+    except OSError as error:
+        raise Refused(2, "cannot resolve %s in %s: git could not be run (%s); recording a "
+                         "candidate needs git on PATH" % (rev, repo, error.strerror or error))
     if out.returncode != 0 or not out.stdout.strip():
         raise Refused(2, "cannot resolve %s in %s" % (rev, repo))
     return out.stdout.strip()
@@ -701,11 +1139,13 @@ def git_rev(repo, rev):
 def cmd_worker(args):
     queue = open_queue(args)
     with queue.locked():
-        queue.job(args.job)
+        job = queue.job(args.job)
         active = queue.worker_active()
         if args.action == "start":
             if queue.stop_requested():
                 raise Refused(3, "stop requested")
+            if job["state"] in FINAL_STATES:
+                raise Refused(8, "job %s is %s" % (job["id"], job["state"]))
             if active:
                 raise Refused(9, "worker %s for job %s is still registered"
                               % (active["id"], active["job"]))
@@ -759,6 +1199,8 @@ def cmd_lock(args):
     with queue.locked():
         if not queue.lock_held():
             raise Refused(4, "lock %s is not held by this queue" % lock)
+        _SNAPSHOT["procs"] = None
+        snapshot()  # Checkpoint 3: unreadable refuses (17) even with no run record
         live = queue.live_runs()
         if live:
             raise Refused(13, "queue-owned processes are still alive (%s); run cleanup first"
@@ -774,6 +1216,11 @@ def cmd_lock(args):
 
 
 def cmd_run(args):
+    if not platform_supported():
+        # Revision 12: before the queue is read, any record is written or anything is started.
+        raise Refused(PLATFORM_REFUSED,
+                      "auto-mode runs need macOS (sandbox-exec and `ps -E`); this system is %s"
+                      % sys.platform)
     queue = open_queue(args)
     command = list(args.command)
     if not command:
@@ -808,6 +1255,10 @@ def cmd_run(args):
                           % (free, queue.data["min_free_gib"]))
         if not job.get("criterion_sha256") or not job.get("candidate_id"):
             raise Refused(6, "record the criterion and candidate before running checks")
+        # Revision 13: a run starts only while the process table can be read (it is needed to
+        # find earlier runs' processes and to track this one); unreadable refuses with 17.
+        _SNAPSHOT["procs"] = None
+        snapshot()
         live = queue.live_runs(job["id"])
         if live:
             raise Refused(13, "an earlier run of job %s still has live processes (%s)"
@@ -861,7 +1312,7 @@ def cmd_run(args):
             # waiting on its output: a detached child may hold the pipe open.
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 _SNAPSHOT["procs"] = None
-                targets = set(survivors(read_json(record_path)))
+                targets = set(survivors_or_unknown(read_json(record_path)) or ())
                 try:
                     os.killpg(probe.pid, sig)
                 except OSError:
@@ -885,9 +1336,9 @@ def cmd_run(args):
                 except subprocess.TimeoutExpired:
                     pass
             _SNAPSHOT["procs"] = None
-            left = survivors(read_json(record_path))
+            left = survivors_or_unknown(read_json(record_path))
             finish("not started", reason="probe timed out after %d s" % timeout,
-                   left_after_timeout=left)
+                   left_after_timeout=UNKNOWN_LEFT if left is None else left)
             raise SystemExit(124)
         with queue.locked():
             current = read_json(record_path)
@@ -955,8 +1406,9 @@ def cmd_run(args):
             os.killpg(proc.pid, signum)
         except OSError:
             pass
+        procs = live_table(snapshot_or_none()) or {}  # unreadable: the group signal above only
         for pid, start in list(tracked.items()):
-            live = snapshot().get(pid)
+            live = procs.get(pid)
             if live is not None and live[3] == start:
                 try:
                     os.kill(pid, signum)
@@ -970,7 +1422,12 @@ def cmd_run(args):
         """Record every descendant of CMD (pid and start time), so a process that later leaves
         the group and the session is still known."""
         _SNAPSHOT["procs"] = None
-        procs = snapshot()
+        procs = live_table(snapshot_or_none())
+        if procs is None:
+            # Revision 13: nothing new can be learned now; the gap is recorded, and the end of
+            # the run cannot then establish that nothing was left behind.
+            gaps.append(now())
+            return
         known = {proc.pid} | {pid for pid, start in tracked.items()
                               if pid in procs and procs[pid][3] == start}
         grew = True
@@ -987,6 +1444,7 @@ def cmd_run(args):
                 current["tracked"] = [{"pid": p, "start": t} for p, t in sorted(tracked.items())]
                 write_json(record_path, current)
 
+    gaps = []
     deadline = time.time() + timeout
     timed_out = False
     while True:
@@ -1001,8 +1459,9 @@ def cmd_run(args):
     if timed_out:
         # End the run and everything identified as its own: TERM, up to 10 s, then KILL.
         record_now = read_json(record_path)
-        targets = set(survivors(record_now)) | {pid for pid, start in tracked.items()
-                                                 if snapshot().get(pid, [None] * 4)[3] == start}
+        procs = live_table(snapshot_or_none()) or {}
+        targets = set(survivors_or_unknown(record_now) or ()) | {
+            pid for pid, start in tracked.items() if procs.get(pid, [None] * 4)[3] == start}
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(proc.pid, sig)
@@ -1016,7 +1475,9 @@ def cmd_run(args):
             end = time.time() + (10 if sig == signal.SIGTERM else 2)
             while time.time() < end:
                 _SNAPSHOT["procs"] = None
-                if proc.poll() is not None and not [p for p in targets if p in snapshot()]:
+                procs = live_table(snapshot_or_none())
+                if proc.poll() is not None and procs is not None and not [
+                        p for p in targets if p in procs]:
                     break
                 time.sleep(0.2)
             else:
@@ -1027,18 +1488,27 @@ def cmd_run(args):
         except subprocess.TimeoutExpired:
             code = -signal.SIGKILL
         _SNAPSHOT["procs"] = None
-        left = survivors(read_json(record_path))
-        finish("timed out", exit_code=124, left_after_timeout=left, signals=received)
+        left = survivors_or_unknown(read_json(record_path))
+        if left is None:
+            left = UNKNOWN_LEFT
+        finish("timed out", exit_code=124, left_after_timeout=left, signals=received,
+               **({"process_table_unreadable": gaps} if gaps else {}))
         queue.event("run %s timed out after %d s%s" % (run_id, timeout,
                                                        (", still alive: %s" % left) if left else ""))
         raise SystemExit(124)
     track()
     exit_code = code if code >= 0 else 128 - code
     _SNAPSHOT["procs"] = None
-    left = group_alive(proc.pid) or bool(survivors(read_json(record_path)))
+    remaining = survivors_or_unknown(read_json(record_path))
+    if remaining is None:
+        gaps.append(now())
+    # Revision 13: when the process table could not be read, leftovers cannot be excluded;
+    # the gaps are recorded with the run, and readiness never accepts such a run.
+    left = group_alive(proc.pid) or bool(remaining)
     interrupted = bool(received) or queue.stop_requested()
     finish("interrupted" if interrupted else "completed", exit_code=exit_code,
-           group_left_running=left, signals=received)
+           group_left_running=left, signals=received,
+           **({"process_table_unreadable": gaps} if gaps else {}))
     raise SystemExit(exit_code)
 
 
@@ -1050,7 +1520,19 @@ def identity_known(pid, recorded_start):
 
 
 def signal_live(queue):
-    for _, record, _ in queue.live_runs():
+    """Send SIGTERM to every run's confirmed target and survivors. Checkpoint 3: records are
+    taken one at a time, so a record whose liveness needs the process table, when the table
+    is unreadable, no longer prevents signalling another run whose wrapper or group is
+    confirmed by its own process alone (`ps -p` before Revision 16); the unreadable table is raised after the loop (stop then
+    still ends with exit 17, never Stopped)."""
+    unreadable = None
+    for _, record in queue.runs():
+        try:
+            if not run_live(record):
+                continue
+        except ProcessTableUnreadable as error:
+            unreadable = unreadable or error
+            continue
         if record.get("status") == "starting":
             target = ("pid", record.get("wrapper_pid"))
             known = identity_known(record.get("wrapper_pid"), record.get("wrapper_start"))
@@ -1071,12 +1553,19 @@ def signal_live(queue):
         else:
             queue.event("stop did not signal %s %s of run %s: identity not confirmed"
                         % (target[0], target[1], record["run_id"]))
-        for pid in survivors(record):
+        try:
+            left = survivors(record)
+        except ProcessTableUnreadable as error:
+            unreadable = unreadable or error
+            continue
+        for pid in left:
             try:
                 os.kill(pid, signal.SIGTERM)
                 queue.event("stop sent SIGTERM to surviving process %d of run %s" % (pid, record["run_id"]))
             except OSError:
                 pass
+    if unreadable is not None:
+        raise unreadable
 
 
 def cmd_stop(args):
@@ -1086,21 +1575,98 @@ def cmd_stop(args):
         if not flag.exists():
             write_text(flag, "time: %s\npid: %d\ncwd: %s\n" % (now(), os.getpid(), os.getcwd()))
             queue.event("stop requested")
-        signal_live(queue)
-        left = queue.remaining()
-    deadline = time.time() + 5
-    while left and time.time() < deadline:
-        time.sleep(0.2)
-        _SNAPSHOT["procs"] = None
-        queue.reload()
-        if queue.worker_active():
+        try:
+            signal_live(queue)
+            # Checkpoint 3: read the table even when no run record needs it, so that stop
+            # never prints Stopped under an unreadable table (report would say Stopping).
+            _SNAPSHOT["procs"] = None
+            snapshot()
             left = queue.remaining()
-            break
-        left = queue.remaining()
+        except ProcessTableUnreadable as error:
+            stop_unknown(queue, error)
+    deadline = time.time() + 5
+    try:
+        while left and time.time() < deadline:
+            time.sleep(0.2)
+            _SNAPSHOT["procs"] = None
+            queue.reload()
+            if queue.worker_active():
+                left = queue.remaining()
+                break
+            left = queue.remaining()
+    except ProcessTableUnreadable as error:
+        stop_unknown(queue, error)
     if left:
         print("Stopping: " + "; ".join(left))
         raise SystemExit(10)
     print("Stopped")
+
+
+def stop_unknown(queue, error):
+    """Revision 13: the stop is recorded, but whether tracked processes remain is unknown:
+    never Stopped. Prints Stopping with the reason and refuses (exit 17)."""
+    queue.event("stop: %s" % error)
+    worker = queue.worker_active()
+    print("Stopping: %s%s" % (error, ("; worker for job %s registered, not yet ended" % worker["job"])
+                              if worker else ""))
+    raise error
+
+
+def cmd_transfer(args):
+    """Revision 13: hand jobs over from the auto queue to an attended successor record.
+    The job (or every job that is not final, with --all) becomes Transferred, a final state:
+    its decision_needed is no longer offered, the successor directory is recorded, and its
+    history, runs and evidence are kept. Refused while a worker is registered for the job or
+    a run of it may be alive (an unreadable process table counts as may be alive)."""
+    queue = open_queue(args)
+    if bool(args.job) == bool(args.all):
+        raise Refused(2, "give one job or --all")
+    if not args.note or not args.note.strip():
+        raise Refused(2, "transfer needs --note saying why and what continues attended")
+    successor = Path(args.to)
+    if not successor.is_dir():
+        raise Refused(2, "successor record directory %s does not exist" % args.to)
+    successor = successor.resolve()
+    if successor == queue.dir or queue.dir in successor.parents:
+        raise Refused(2, "the successor record must be outside the queue directory")
+    with queue.locked():
+        if args.all:
+            jobs = [j for j in queue.data["jobs"] if j["state"] not in FINAL_STATES]
+            if not jobs:
+                raise Refused(8, "no job left to transfer")
+        else:
+            jobs = [queue.job(args.job)]
+        worker = queue.worker_active()
+        _SNAPSHOT["procs"] = None
+        snapshot()  # Checkpoint 3: unreadable refuses (17) even with no run record
+        for job in jobs:
+            if job["state"] in FINAL_STATES:
+                raise Refused(8, "job %s is %s; a final job is not transferred" % (job["id"], job["state"]))
+            if worker and worker["job"] == job["id"]:
+                raise Refused(9, "worker %s for job %s is still registered; end it first"
+                              % (worker["id"], job["id"]))
+            live = queue.live_runs(job["id"])
+            if live:
+                raise Refused(13, "a run of job %s still has live processes (%s); run cleanup first"
+                              % (job["id"], live[0][2]))
+        for job in jobs:
+            old = job["state"]
+            entry = {"time": now(), "from_state": old, "to": str(successor), "note": args.note}
+            if job.get("decision_needed"):
+                entry["decision_needed_at_transfer"] = job.pop("decision_needed")
+            for key in ("packet", "packet_manifest_sha256", "approval_quote",
+                        "approval_manifest_sha256"):
+                if job.get(key):
+                    entry[key] = job.pop(key)
+            job.pop("waiting", None)
+            job["transfer"] = entry
+            job["state"] = "Transferred"
+            job["notes"].append({"time": entry["time"], "state": "Transferred", "note": args.note})
+            queue.event("job %s %s -> Transferred to %s note: %s"
+                        % (job["id"], old, successor, args.note.replace("\n", " ")))
+        queue.save()
+    for job in jobs:
+        print("%s Transferred to %s" % (job["id"], successor))
 
 
 def cmd_reconcile(args):
@@ -1159,25 +1725,47 @@ def cmd_install(args):
         start_error = str(error)
     else:
         start_error = None
-    found = None
+    found = normalized = None
     for line in stdout.splitlines():
         fields = line.split()
         if len(fields) == 2 and fields[0] == "FINGERPRINT":
             found = fields[1]
+        elif len(fields) == 2 and fields[0] == "NORMALIZED":
+            normalized = fields[1]
+    # Availability needs the exact fingerprint, always (Revision 13 changes only the reason).
     ok = returncode == 0 and found is not None and found == args.expect
+    known_codes = {3: "a process runs from the installation",
+                   4: "the process table could not be read"}
+    previous = queue.data.get("installation") or {}
+    recorded_normalized = args.expect_normalized or previous.get("expected_normalized")
     if start_error:
         reason = "its fingerprint script could not be started"
     elif returncode:
-        reason = "its fingerprint script failed (exit %d)" % returncode
+        reason = "its fingerprint script failed (exit %d%s)" % (
+            returncode, (": " + known_codes[returncode]) if returncode in known_codes else "")
     elif found is None:
         reason = "its fingerprint script printed no fingerprint"
+    elif normalized and recorded_normalized and normalized == recorded_normalized:
+        # Revision 13: report-only classification. The installation stays unavailable; only
+        # an attended validation may record a new exact value.
+        reason = ("timestamp-only differences: attended validation needed (the exact fingerprint "
+                  "differs from the recorded starting state; the normalized value, which ignores "
+                  "only known timestamp fields, matches)")
     else:
         reason = "it no longer matches its recorded starting state"
     with queue.locked():
         kept = baseline if (baseline and not ok) else args.expect
+        if ok:
+            kept_normalized = normalized
+        else:
+            kept_normalized = previous.get("expected_normalized") or args.expect_normalized
         queue.data["installation"] = {
             "state": "available" if ok else "unavailable", "checked": now(), "script": args.script,
             "expected": kept, "found": found, "reason": "" if ok else reason}
+        if kept_normalized:
+            queue.data["installation"]["expected_normalized"] = kept_normalized
+        if normalized:
+            queue.data["installation"]["found_normalized"] = normalized
         queue.save()
         queue.event("installation %s%s%s" % (queue.data["installation"]["state"],
                                              "" if ok else ": " + reason,
@@ -1224,6 +1812,10 @@ def cmd_cleanup(args):
     queue = open_queue(args)
     with queue.locked():
         job = queue.job(args.job)
+        # Checkpoint 3: the table is read even when the job has no run record; unreadable
+        # refuses (17) rather than printing Cleaned.
+        _SNAPSHOT["procs"] = None
+        snapshot()
         for _, record in queue.runs(job["id"]):
             if (record.get("status") == "running" and same_process(record.get("pid"),
                                                                    record.get("process_start"))) or (
@@ -1277,8 +1869,18 @@ def cmd_workers(args):
 def cmd_report(args):
     queue = open_queue(args)
     lines = []
+    # Revision 13: with an unreadable process table nothing about live processes is known:
+    # never Stopped, no readiness, and every job with runs shows unknown; exit 17 after printing.
+    table_error = None
+    try:
+        snapshot()
+    except ProcessTableUnreadable as error:
+        table_error = error
     if queue.stop_requested():
-        lines.append("**Stopping**" if queue.remaining() else "**Stopped**")
+        lines.append("**Stopping**" if table_error or queue.remaining() else "**Stopped**")
+        lines.append("")
+    if table_error:
+        lines.append("**Process table unreadable:** %s" % table_error)
         lines.append("")
     installation = queue.data.get("installation") or {}
     if installation.get("state") == "unavailable":
@@ -1288,9 +1890,13 @@ def cmd_report(args):
     lines.append("| --- | --- | --- |")
     for job in queue.data["jobs"]:
         runs = [r for _, r in queue.runs(job["id"])]
-        open_runs = [r for r in runs if r.get("status") in ("starting", "running") or run_live(r)]
         state = job["state"]
-        if open_runs:
+        open_runs = [] if table_error else [
+            r for r in runs if r.get("status") in ("starting", "running") or run_live(r)]
+        if table_error and runs:
+            result = "unknown (%s; process table unreadable)" % state.lower()
+            step = "report again once the process table can be read"
+        elif open_runs:
             alive = [r for r in open_runs if run_live(r)]
             result = ("running %s" % alive[0]["label"] if alive
                       else "unknown (a run ended without a completion record)")
@@ -1307,8 +1913,15 @@ def cmd_report(args):
                 step = "approve for integration / inspect / revise / discard"
             else:
                 result = "results stale or incomplete (%s)" % failed
-                step = ("freeze a corrected packet in a new directory and mark it ready again"
+                # Revision 13: the helper refuses only what is in the frozen bytes, which an
+                # ERRATA.md note cannot change; for a clerical slip the new freeze reuses the
+                # same evidence with no rerun (WORKER.md).
+                step = ("freeze a corrected packet in a new directory and mark it ready again "
+                        "(clerical slip: same evidence, note in ERRATA.md, no rerun)"
                         if failed.startswith(("packet", "SCREENING.txt")) else "rerun the affected checks")
+        elif state == "Transferred":
+            result = "transferred to %s" % job["transfer"]["to"]
+            step = "continued attended there; nothing to decide in this queue"
         elif state == "Blocked":
             result = "blocked: %s" % last_note(job)
             step = (("decision needed: " + job["decision_needed"]) if job.get("decision_needed")
@@ -1326,6 +1939,8 @@ def cmd_report(args):
         title = job["id"] + ((" " + job["title"]) if job.get("title") else "")
         lines.append("| %s | %s | %s |" % (cell(title), cell(result), cell(step)))
     print("\n".join(lines))
+    if table_error:
+        raise table_error
 
 
 def last_note(job):
@@ -1399,6 +2014,13 @@ def main(argv=None):
     p.add_argument("--timeout", type=int)
     p.set_defaults(func=cmd_run)
 
+    p = sub.add_parser("transfer", allow_abbrev=False)
+    p.add_argument("job", nargs="?")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--to", required=True)
+    p.add_argument("--note", required=True)
+    p.set_defaults(func=cmd_transfer)
+
     sub.add_parser("stop", allow_abbrev=False).set_defaults(func=cmd_stop)
     sub.add_parser("reconcile", allow_abbrev=False).set_defaults(func=cmd_reconcile)
 
@@ -1436,9 +2058,14 @@ def main(argv=None):
     p.add_argument("action", choices=("check", "show"))
     p.add_argument("--script")
     p.add_argument("--expect")
+    p.add_argument("--expect-normalized")
     p.add_argument("--new-baseline", action="store_true")
     p.set_defaults(func=cmd_install)
 
+    if psutil is None:
+        # Revision 16: before any argument is read or any file touched.
+        print("REFUSED: %s" % PSUTIL_MESSAGE, file=sys.stderr)
+        return PSUTIL_MISSING
     argv = list(sys.argv[1:] if argv is None else argv)
     command = []
     if "--" in argv:

@@ -17,7 +17,11 @@ Please set up GuidedCoding from /absolute/path/to/cctbx_project/libtbx/guided_co
 ```
 
 This message asks Claude to perform the setup steps. It needs the source
-path to find the kit from another project. If the skill folder was created
+path to find the kit from another project. If Claude Code is already
+helping you install Guided Coding, it performs this registration step in
+the same conversation; a new conversation is needed only afterward, to use
+`/guided_coding`. (Claude: perform the registration step in the current
+conversation.) If the skill folder was created
 after the conversation started, open a new conversation.
 Confirm the command with `/guided_coding help`; the `/skills` listing alone
 was not a reliable indicator in the recorded Mac trial.
@@ -39,17 +43,18 @@ manifest cannot establish their origin by themselves. Inspect its member
 names before extraction; the expected source archive contains
 `libtbx/guided_coding/`, without an enclosing release-named folder.
 
-Use an empty staging directory. Replace the paths and run this **whole
-Bash block**, not separate commands:
+Use an empty staging directory. Replace the paths and paste this **whole
+block** as one command, not separate commands (each line ends with `\`,
+which continues it on the next line):
 
 ```bash
-mkdir /path/to/empty-gc-review &&
-tar -xzf /path/to/reviewed-guided-coding.tgz -C /path/to/empty-gc-review &&
-cd /path/to/empty-gc-review/libtbx/guided_coding &&
-shasum -a 256 -c SOURCE_MANIFEST.sha256 &&
-GC_PAYLOAD_ROOT="$(pwd -P)/payload" python3 -I -B payload/tools/screen_check.py verify-source . &&
-cat payload/RELEASE &&
-grep -Fq 'r10 rev18 candidate' payload/RELEASE
+mkdir /path/to/empty-gc-review && \
+tar -xzf /path/to/reviewed-guided-coding.tgz -C /path/to/empty-gc-review && \
+cd /path/to/empty-gc-review/libtbx/guided_coding && \
+shasum -a 256 -c SOURCE_MANIFEST.sha256 && \
+env GC_PAYLOAD_ROOT="`pwd -P`/payload" libtbx.python -I -B payload/tools/screen_check.py verify-source . && \
+cat payload/RELEASE && \
+grep -Eq '^guided_coding 2\.0 pilot r10 rev19 ' payload/RELEASE
 ```
 
 Any failed command skips the rest of the block. In particular, a failed
@@ -57,20 +62,29 @@ listed checksum must stop **before executing the package's checker**.
 Stop dependent work on failure; a successful command appended later would
 not repair the failed check. Require all listed hashes, `VERIFIED complete
 source`, and the expected release identity from your handoff. The final
-`grep` is only a family-label check, not an exact revision check.
+`grep` checks that the release line begins with the `r10 rev19` label;
+it is not an exact revision check.
 
 The complete-source check rejects missing, changed and extra source files,
 links and multiply linked files. Its narrow exception permits certain
 installer-generated `__pycache__` files beside listed Python modules. It
 reports the ignored count and checks their names and header type, not their
-contents. The two tools do not load that package bytecode when invoked as
-documented. Ordinary Python imports, including direct unit-test imports,
-can load caches; run those tests on a trusted clean copy.
+contents. The documented checking tools run from source rather than loading
+that package bytecode. Ordinary Python imports, including direct unit-test
+imports, can load caches; run those tests on a trusted clean copy.
 
-The commands shown here require Bash and `shasum`, plus a suitable Python 3.
-They are not csh syntax. Use the appropriate shell explicitly rather than
-pasting Bash environment assignments into csh. Project build/test commands
-may have a different, recorded shell requirement.
+The commands shown here work as written in bash, zsh, csh and tcsh. They
+need `shasum` and Python 3.10 or newer. Where `shasum` is missing (some
+Linux systems), replace `shasum -a 256 -c SOURCE_MANIFEST.sha256` in the
+block with `sha256sum -c SOURCE_MANIFEST.sha256`; it reads the same
+manifest file.
+
+Project build/test commands may have a different, recorded shell
+requirement. Supported systems: the Claude app on macOS, and Claude Code
+in Terminal on macOS and Linux (on Linux a real `/gc` session has not yet
+been observed; see [Clients and
+platforms](GUIDED_CODING_VERIFICATION.md#important-remaining-uncertainty));
+auto-mode runs need macOS; Windows is not supported (see the User Guide's "Before you begin").
 
 ## One-time registration
 
@@ -79,13 +93,13 @@ any existing personal skill path. Then run the complete guarded block with
 your canonical source path:
 
 ```bash
-cd /path/to/cctbx_project/libtbx/guided_coding &&
-shasum -a 256 -c SOURCE_MANIFEST.sha256 &&
-GC_PAYLOAD_ROOT="$(pwd -P)/payload" python3 -I -B payload/tools/screen_check.py verify-source . &&
-cat payload/RELEASE &&
-grep -Fq 'r10 rev18 candidate' payload/RELEASE &&
-GC_PAYLOAD_ROOT="$(pwd -P)/payload" python3 -I -B payload/tools/screen_check.py check-claude-version &&
-GC_PAYLOAD_ROOT="$(pwd -P)/payload" python3 -I -B payload/tools/screen_check.py register-skill .
+cd /path/to/cctbx_project/libtbx/guided_coding && \
+shasum -a 256 -c SOURCE_MANIFEST.sha256 && \
+env GC_PAYLOAD_ROOT="`pwd -P`/payload" libtbx.python -I -B payload/tools/screen_check.py verify-source . && \
+cat payload/RELEASE && \
+grep -Eq '^guided_coding 2\.0 pilot r10 rev19 ' payload/RELEASE && \
+env GC_PAYLOAD_ROOT="`pwd -P`/payload" libtbx.python -I -B payload/tools/screen_check.py check-claude-version && \
+env GC_PAYLOAD_ROOT="`pwd -P`/payload" libtbx.python -I -B payload/tools/screen_check.py register-skill .
 ```
 
 `register-skill` rechecks the source and the Claude Code version itself, then creates exactly
@@ -176,6 +190,22 @@ The generic GC package supplies none of these PHENIX-specific values.
 Relevant adopted values and their provenance go into the project's method,
 so a later session does not need the original card attachment.
 
+When a later conversation needs a card (for example the setup conversation
+after a registration step), the handoff either includes the complete card
+text or names a **verified local file**: a file at an absolute path that
+the handing-over conversation has itself opened and read in full, and
+found to contain the complete card, from its first heading to its end, with
+nothing missing or changed. A file the procedure produced and verified also
+qualifies when the card in it is stored in another encoding, such as the
+generated PHENIX developer page, where the card is HTML-escaped: the
+handing-over conversation checks that the decoded card text is complete
+and unchanged. The handoff message names the file and where it is (and,
+for an encoded copy, that the card is HTML-escaped); it carries no hash.
+Record the file's SHA-256 in the task record instead, where a later check
+can compare it. A path that was not opened, a file that holds only part of
+the card, or a summary of it is not a verified local file; include the
+card text instead.
+
 ### Contract adoption and loaded instructions
 
 Before guided work, the project’s current instructions must state that it
@@ -199,6 +229,11 @@ build, test, coordination and publication rules.
 
 Review that example before using it. Keep the project’s existing
 instruction files; do not create another one just to match the example.
+Adoption is personal and untracked: record it in an untracked file the
+client loads, such as `CLAUDE.local.md`, never in a shared, tracked
+`CLAUDE.md` or `AGENTS.md`. When the project has an `AGENTS.md`, the
+method points to it rather than copying its rules, and records whether
+those rules let the agent push.
 In particular, adding `CLAUDE.local.md` can change whether `AGENTS.md` loads
 under Claude Code's default selection. Inspect the active setting rather
 than assuming both files load; see the
@@ -268,22 +303,61 @@ of each guided conversation, not before every message.
 
 A task presents **APPROVE / REVISE / STOP** for its plan and
 **INTEGRATE / REVISE / DISCARD** for the tested result. Publication has its
-own **PUBLISH / HOLD** decision. The approval report includes the complete
+own **PUBLISH / HOLD** decision. While a required outside reading is
+still pending, **ACCEPT / REVISE / DISCARD** can accept the exact frozen
+candidate; it merges and publishes nothing. Every decision screen is
+pasted in full into Claude's reply, with earlier screens marked
+superseded. The approval report includes the complete
 tested diff and exact new test code, or an explicit “none added” with the
 check used. An Outside Reviewer recommends; the Developer decides.
 A tool-permission dialog does not replace those decisions.
 
 For a batch that will be published, the frozen packet also records the
-exact outgoing commits (`OUTGOING.txt`) and the suite result or the
-Developer's quoted waiver for that batch, so that one outside reading can
-answer the integration and the publication question for that packet. If
+exact outgoing commits (`OUTGOING.txt`, generated by
+`publication_precheck.py outgoing ... --fetch >> PACKET/OUTGOING.txt` once
+per repository; see `payload/PUBLICATION_PACKET.md`; with more than one
+block, `publication_precheck.py check` (which since revision 19 always takes `--packet PACKET --identity PACKET_IDENTITY`, the identity on the approved PUBLICATION screen) needs `--repository NAME`, where NAME
+is the block's `repository:` value, the repository's top folder name) and
+the suite result or the Developer's quoted waiver for that batch, so that
+one outside reading can answer the integration and the publication question for that packet. If
 the proposal changes afterwards, it gets a new identity and a
-reassessment; the earlier verdict is not inherited. A publication plan
+reassessment; the earlier verdict is not inherited, except by the
+mechanical carry-over of revision 19: after a restage,
+`publication_precheck.py carry-over REPO --reviewed OLD_OUTGOING
+--outgoing NEW_OUTGOING [--fetch] [--output CARRYOVER.txt] [--expect
+CARRYOVER.txt]` checks that the changed files and their blobs are the
+same, the diff is byte-identical and no upstream commit added by the
+restage touches them, for each repository block (given as `NAME=PATH`
+when there are several), and writes `CARRYOVER.txt`; with it the
+PUBLICATION check accepts the reading of the earlier packet and LIMITS says
+what the check does not show. The PUBLISH precheck recomputes it
+(`--expect`, and `check`). An addendum is then needed only when it
+refuses. The server suite never carries over (payload/PUBLICATION_PACKET.md). A publication plan
 names each installation to update separately; publication alone updates
 none. The accepted push is one explicit `<commit>:refs/heads/<branch>`
 with tag following disabled, after `publication_precheck.py` has compared
 the live repository with the record; no development or recovery tag is
 created.
+
+Where the project's rules forbid the agent any `git push` (cctbx's
+draft `AGENTS.md` says "in any form", which this procedure reads as including
+dry runs), publication uses the **no-push
+variant** (WORKER.md): Claude runs `publication_precheck.py check` without
+`--dry-run` and `confirm --before`, vets the exact push command (and its
+dry-run form), hands both to you to run yourself, then runs `confirm
+--tags STATE` (the tag state `--before` printed) to check that the remote
+branch is at the outgoing commit and no tag was added, removed or moved,
+and records the result. `confirm` reads the remote with
+`git ls-remote` and never pushes or fetches.
+
+The STOP and PUBLICATION screens, like PLAN, ACCEPT and RESULT, end with
+a `Recommendation:` line giving the recommended choice and why, and a
+`Next:` line; the checker refuses either missing (revision 17). For a
+full-path change you may waive the outside reading before integration in
+your own words; it is recorded in `OUTSIDE_WAIVER.md` and checked with
+`screen_check.py present result ... --waiver OUTSIDE_WAIVER.md` (never
+together with `--reading`). A waiver names one packet, covers integration
+only, and never covers publication.
 
 Use the project's adopted testing and publication rules. Preparing a test,
 running it, integration and a push are different actions. The pilot's
@@ -298,7 +372,91 @@ the job text after it. A pasted message that merely begins with the
 command does not start the skill. Claude turns the request into a job
 list, shows one checked start notice and then works without questions.
 The start notice gives the absolute path of the queue helper in use, the
-stop command and the run boundary.
+stop command and the run boundary. The stop command is written as
+`screen_check.py stop-command` prints it: the absolute interpreter path
+of the Python that runs the kit (revision 18), `-I -B`, the helper and
+`stop`; a path that contains a space is put in single quotes, which
+every supported shell reads as one word (revision 17).
+
+**Auto-mode runs need macOS.** The queue helper blocks outside network
+for its runs with `sandbox-exec` and finds a run's processes by an
+environment marker, read on macOS only (with `ps -E` until revision 16,
+since then through psutil); both are macOS mechanisms. The helper needs
+Python 3.10 or newer (written `libtbx.python`) and psutil; without
+psutil every helper command stops (exit 18, "requires psutil, which
+<python> does not have: make a venv and install it there (python3 -m venv
+DIR, then DIR/bin/python -m pip install psutil; not --user, which the
+kit's -I ignores), then run with DIR/bin/python; or use libtbx.python").
+On any
+other system `auto_queue.py run` refuses (exit 15, "auto-mode runs need
+macOS (sandbox-exec and `ps -E`)") before anything starts, whether or not
+the job has a network grant. The helper has no option, environment
+variable or setting that allows it. `init` needs
+`--lock-dir`, the lock directory named in the project method; without it
+init refuses (exit 2) and creates nothing.
+
+The kit's tests are meant to run on Linux as well. There they run the
+helper through a test-only launcher, `tests/auto_queue_standin.py`, that
+runs it without the sandbox and without the platform refusal; its
+stand-in for `sandbox-exec` runs commands unrestricted. The launcher is
+for the kit's own tests only and refuses real queues: before it starts or
+records anything it exits 16 unless every queue path the helper would open (the
+home from `--home` or `GC_AUTO_HOME`, never the default; every `--queue`;
+the queue named by the home's `ACTIVE` file) lies inside a temporary
+directory of the test run that holds the tests' marker file
+`GC_KIT_TEST_QUEUE_ROOT`. It refuses an empty or blank `--home`, `--queue`,
+`--records`, `--lock-dir` or `GC_AUTO_HOME` so that the paths it checks are
+the ones the helper opens (the helper reads a blank value as a relative
+path, falls back to another home or queue for an empty `--home`,
+`GC_AUTO_HOME` or `--queue`, resolves an empty `--records` to the current
+directory, and refuses an empty `--lock-dir` itself). A marker written there
+by hand is accepted, and so is a symlink planted by hand inside a marked
+test queue (the check resolves the queue directory, not what is inside it),
+so this guards against mistaken use, not deliberate misuse. It checks only
+those queue paths: other paths, such as `--log`, `--cwd`, `--file`,
+`--packet`, `--script`, `--grant` and `--jobs`, are not checked, so a run
+started through it can write its log anywhere.
+The following is the Linux coverage, shown by a simulated non-macOS
+run on a Mac and by a real Linux run of the kit suite (anaconda, October 12,
+2026: 269 tests, 261 passed, 8 skipped). The tests cover queue
+states, init, runs and their records, time limits, approvals, frozen packets and
+screening, the worker registry, the lock, stop, reconcile, cleanup and
+recovery, the installation check, the report and the screens, and the
+real helper's refusal of runs off macOS. Eight tests are skipped off macOS
+with their reason (revision 13 corrects the earlier count of four):
+`test_outside_network_blocked_by_default` and
+`test_probe_network_blocked_by_default` (the real sandbox-exec refusal of
+outside connections), `test_survivor_setsid_found_by_run_id_marker` and
+`test_probe_surviving_killed_wrapper_is_found` (the `ps -E` marker),
+`test_outside_name_lookup_blocked` and its allowed-job companions
+`test_network_allowed_job` and `test_outside_name_lookup_allowed_job`
+(off macOS the stand-in never blocks, so they would show only that the
+host is offline or online), and
+`test_probe_timeout_with_detached_child_holding_output` (a duplicate of
+its P10 variant there). The three tests that would contact a real
+outside host run only with `GC_TEST_NETWORK=1`. Off a real Mac the
+sandbox-exec self-test route is skipped too (since revision 15 the two
+Mach-O normalizer tests use bundles the tests write and run everywhere;
+the real-tool conformance tests are skipped where `cc`, or `ar` and
+`ranlib`, are missing, and the Mach-O one off macOS).
+
+Revision 13 adds `auto_queue.py transfer JOB|--all --to DIR --note TEXT`,
+which hands jobs over to an attended task record: the job becomes
+Transferred (final, never reopened; its decision is no longer offered;
+its history and evidence are kept). `install check` also reads an
+optional `NORMALIZED` line from the fingerprint script and
+`--expect-normalized VALUE`; when only that value matches it says
+"timestamp-only differences: attended validation needed" and the
+installation stays unavailable. When the process table cannot be read,
+the helper refuses with exit 17 and reports nothing as stopped, cleaned
+or released, also when no run record exists; stop first
+signals every run whose wrapper or group `ps -p` confirms. Revision 16:
+the helper reads the process table through psutil instead of `ps`, with
+the same refusals, and the kit's own suite now runs inside `sandbox-exec`
+too (where `/bin/ps` was refused); when psutil cannot read the table, the
+auto-queue tests report one failure naming the attended route. Tests that
+need git skip without it, and `publication_precheck.py check` and
+`outgoing` refuse without git (exit 2).
 
 **What the invocation grants.** It is your advance grant for the listed
 jobs only, filed as `GRANT.md` in the queue's record before any job
@@ -348,7 +506,8 @@ start notice from any Terminal; it works in any shell, csh included. It
 reports **Stopped** only when the registered worker has ended and no
 build or test started through the helper, or any descendant it can
 identify, is still alive; otherwise it reports **Stopping** and what
-remains. Known gaps: a system program that a test starts in its own
+remains. A process that has exited but that its parent has not yet
+collected (a zombie; on Linux, a single-threaded one) does not count as alive. Known gaps: a system program that a test starts in its own
 session, from a parent that exits within about a second, is not seen;
 and a request that a test hands to another system service is not
 blocked by the network block.
@@ -366,6 +525,27 @@ the earlier session has ended.
 **Not in this release.** There is no `auto integrate`. Integration and
 publication of approved jobs are ordinary guided work on your later
 instruction, with your PUBLISH decision for the combined packet.
+
+## Coordinating several sessions
+
+Guided Coding has no scheduler for parallel jobs. When you run more than
+one Claude session on related work (for example two attended tasks, or an
+attended task beside an auto queue), the sessions coordinate by messages
+between them, which you pass on or which one session sends to another.
+They agree, before either starts the affected step:
+
+- **owner**: which session owns which task and branch;
+- **files**: which files or repositories each may change;
+- **order**: in which order their changes are integrated and published;
+- **lock**: who uses a shared installation, server or data folder, when,
+  and through which lock (for example a server's lock directory).
+
+Each session keeps its own worktree. Shared resources are used only under
+their lock. An auto queue has exactly one worker; do not start a second
+queue or worker on the same test installation. A message from another
+session is information, not your approval: it cannot authorize
+integration, publication, an installation update or a waiver. Those still
+need your decision in the session that does the work.
 
 ## Ordinary conversations and session titles
 

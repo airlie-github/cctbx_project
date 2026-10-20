@@ -887,37 +887,50 @@ def read_chemical_component_filename(filename, verbose=False):
   Generating H restraints from Chemical Components for %s failed. Please supply
   restraints.
   ''' % code)
-  for i, (code, monomer) in enumerate(ccd.items()):
-    molecule = Chem.Mol()
-    desc = monomer.get_loop_or_row('_chem_comp')
-    rwmol = Chem.RWMol(molecule)
-    atom = monomer.get_loop_or_row('_chem_comp_atom')
-    # if atom is None: continue
-    conformer = Chem.Conformer(atom.n_rows())
-    for j, tmp in enumerate(atom.iterrows()):
-      new = Chem.Atom(tmp.get('_chem_comp_atom.type_symbol').capitalize())
-      new.SetFormalCharge(int(tmp.get('_chem_comp_atom.charge')))
-      for prop in ['atom_id', 'type_symbol']:
-        new.SetProp(prop, tmp.get('_chem_comp_atom.%s' % prop, '?'))
-      rdatom = rwmol.AddAtom(new)
-      if xyzs[j][0] in ['?']:
-        pass
-      else:
-        xyz = (float(xyzs[j][0]), float(xyzs[j][1]), float(xyzs[j][2]))
-        conformer.SetAtomPosition(rdatom, xyz)
-      lookup[tmp.get('_chem_comp_atom.atom_id')]=j
-    bond = monomer.get_loop_or_row('_chem_comp_bond')
-    if bond:
-      for tmp in bond.iterrows():
-        atom1 = tmp.get('_chem_comp_bond.atom_id_1')
-        atom2 = tmp.get('_chem_comp_bond.atom_id_2')
-        atom1 = lookup.get(atom1)
-        atom2 = lookup.get(atom2)
-        order = tmp.get('_chem_comp_bond.value_order')
-        order = bond_order_ccd[order]
-        rwmol.AddBond(atom1, atom2, order)
-  rwmol.AddConformer(conformer)
-  Chem.SanitizeMol(rwmol)
+  def build(skip_metal_bonds):
+    for i, (code, monomer) in enumerate(ccd.items()):
+      molecule = Chem.Mol()
+      desc = monomer.get_loop_or_row('_chem_comp')
+      rwmol = Chem.RWMol(molecule)
+      atom = monomer.get_loop_or_row('_chem_comp_atom')
+      # if atom is None: continue
+      conformer = Chem.Conformer(atom.n_rows())
+      for j, tmp in enumerate(atom.iterrows()):
+        new = Chem.Atom(tmp.get('_chem_comp_atom.type_symbol').capitalize())
+        # unknown charge (TPT PT1) -> 0
+        charge = tmp.get('_chem_comp_atom.charge')
+        new.SetFormalCharge(0 if charge in ['?', '.'] else int(charge))
+        for prop in ['atom_id', 'type_symbol']:
+          new.SetProp(prop, tmp.get('_chem_comp_atom.%s' % prop, '?'))
+        rdatom = rwmol.AddAtom(new)
+        if xyzs[j][0] in ['?']:
+          pass
+        else:
+          xyz = (float(xyzs[j][0]), float(xyzs[j][1]), float(xyzs[j][2]))
+          conformer.SetAtomPosition(rdatom, xyz)
+        lookup[tmp.get('_chem_comp_atom.atom_id')]=j
+      bond = monomer.get_loop_or_row('_chem_comp_bond')
+      if bond:
+        for tmp in bond.iterrows():
+          if (skip_metal_bonds and
+              tmp.get('_chem_comp_bond.pdbx_metal_coordination_flag') == 'Y'):
+            continue
+          atom1 = tmp.get('_chem_comp_bond.atom_id_1')
+          atom2 = tmp.get('_chem_comp_bond.atom_id_2')
+          atom1 = lookup.get(atom1)
+          atom2 = lookup.get(atom2)
+          order = tmp.get('_chem_comp_bond.value_order')
+          order = bond_order_ccd[order]
+          rwmol.AddBond(atom1, atom2, order)
+    rwmol.AddConformer(conformer)
+    return code, desc, rwmol
+  code, desc, rwmol = build(skip_metal_bonds=False)
+  try:
+    Chem.SanitizeMol(rwmol)
+  except Exception:
+    # metal coordination as plain SING bonds over-fills valences (TPT Pt-N)
+    code, desc, rwmol = build(skip_metal_bonds=True)
+    Chem.SanitizeMol(rwmol)
   # from rdkit.Chem.PropertyMol import PropertyMol
   # molecule = PropertyMol(molecule)
   molecule = rwmol.GetMol()
@@ -938,7 +951,7 @@ def get_molecule_from_resname(resname):
   try:
     molecule = read_chemical_component_filename(filename)
   except Exception as e:
-    print(e)
+    print('Could not read CCD entry %s: %s' % (resname, e))
     return None
   return molecule
 
@@ -993,43 +1006,6 @@ def _generate_models_from_residues(cctbx_model):
     chain=rg.parent().id
     resseq=rg.resseq.strip()
     s=f'chain {chain} and resseq {resseq}'
-    sel = cctbx_model.selection(s)
-    tm = cctbx_model.select(sel)
-    yield tm
-
-def _generate_models_from_fragments(cctbx_model):
-  assert 0
-  from mmtbx.conformation_dependent_library import generate_protein_fragments
-  pdb_hierarchy=cctbx_model.get_hierarchy()
-  geometry_restraints_manager=cctbx_model.get_restraints_manager().geometry
-  selections=[[]]
-  for j, threes in enumerate(generate_protein_fragments(pdb_hierarchy,
-                                                        geometry_restraints_manager,
-                                                        length=2,
-                                                        include_non_linked=True,
-                                                        include_non_standard_peptides=True,
-                                                        include_d_amino_acids=True,
-                                                        # verbose=1,
-                                                        )):
-    if threes.are_linked():
-      # selections[-1].append(threes[0].resseq.strip())
-      chain_resseq=(threes[1].parent().parent().id, threes[1].resseq.strip())
-      if chain_resseq not in selections[-1]: selections[-1].append(chain_resseq)
-    else:
-      chain_resseq=(threes[0].parent().parent().id, threes[0].resseq.strip())
-      if chain_resseq not in selections[-1]: selections[-1].append(chain_resseq)
-      selections.append([])
-      chain_resseq=(threes[1].parent().parent().id, threes[1].resseq.strip())
-      if chain_resseq not in selections[-1]: selections[-1].append(chain_resseq)
-    # yield threes.are_linked()
-  for st in selections:
-    if len(st)==1:
-      chain, resseq = st[0]
-      s=f'chain {chain} and resseq {resseq}'
-    else:
-      chain, resseq1 = st[0]
-      tmp, resseq2 = st[-1]
-      s=f'chain {chain} and resseq {resseq1}:{resseq2}'
     sel = cctbx_model.selection(s)
     tm = cctbx_model.select(sel)
     yield tm
@@ -1345,13 +1321,20 @@ def residue_molecule(model, residue_group, altloc="", fsc0=None):
   at that total. Otherwise DetermineBondOrders at that total, in the input atom
   order, then RDKit's canonical order, then 10 seeded random orders (it depends on
   the order); the first that succeeds and agrees with the file is taken
-  (search["order"]); none: failure.
-  Without formal charges: the totals -4..+4; valid: DetermineBondOrders succeeds and
-  the bonds agree with the file; totals whose structure charges a carbon set aside
-  when others are valid; one left: taken, charge_certain False; else failure.
+  (search["order"]). If none does and the file charges a carbon with four bonds
+  (e.g. GeoStd's -1 on the CH2 next to a sulfonium), the same is tried with those
+  charges ignored and the total lowered by them (noted in charge_notes);
+  charge_certain stays True. Still none: the formal charges are inconsistent
+  (noted) and the total is searched as without formal charges.
+  Without formal charges, or with inconsistent ones: the totals -10..+10; valid:
+  DetermineBondOrders succeeds and the bonds agree with the file; totals whose
+  structure charges a carbon set aside when others are valid; one left: taken,
+  charge_certain False; else failure.
   Agreement: the file's explicit single/double/triple bonds between heavy atoms,
   bonds aromatic in RDKit apart; bonds from one atom to neighbours of one element
-  (carboxylate, nitro, guanidinium, phosphate) compared as a set of orders.
+  (carboxylate, nitro, guanidinium, phosphate) compared as a set of orders; a file
+  double bond that RDKit draws as a single bond between a +1 and a -1 atom (a
+  sulfoxide S=O as [S+]-[O-]) agrees.
 
   Returns group_args: ok, reason (why not ok), mol (None unless ok; never
   unsanitized; metal-free), rdkit_to_iseq {mol index: model i_seq} (caps and added

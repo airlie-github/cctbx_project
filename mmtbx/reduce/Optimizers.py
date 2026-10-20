@@ -164,7 +164,7 @@ class FlippedMoverInfo(object):
 
 class Optimizer(object):
 
-  def __init__(self, probePhil, addFlipMovers, model, modelIndex = 0, altID = None,
+  def __init__(self, probePhil, addFlipMovers, model, modelIndex = None, altID = None,
                 bondedNeighborDepth = 4,
                 useNeutronDistances = False,
                 minOccupancy = 0.02,
@@ -307,7 +307,9 @@ class Optimizer(object):
     # None is specified and the specified one if it is specified.
 
     try:
-      model.setup_riding_h_manager()
+      # None, not False: callers outside reduce2 keep the scattering-table rule
+      model.setup_riding_h_manager(
+        use_neutron_distances=True if self._useNeutronDistances else None)
     except Exception:
       # If an optimized has already been run on the model, our riding H manager will
       # have already been set up.  When one has already been set up, this causes
@@ -622,6 +624,7 @@ class Optimizer(object):
 
         # Do coarse optimization on the multi-Mover Cliques.
         for g in groupCliques:
+          startTime = time.time()
           remainingSeconds = 1e12
           if stopOptimizingAt > 0.0:
             remainingSeconds = stopOptimizingAt - time.time()
@@ -648,7 +651,11 @@ class Optimizer(object):
           self._infoString += infoString
           ret = bestScore
 
-          self._infoString += _VerboseCheck(self._verbosity, 1,"Clique optimized with score {:.2f}\n".format(ret))
+          stopTime = time.time()
+
+          self._infoString += _VerboseCheck(self._verbosity, 1,
+            "Clique of size {:d} optimized with score {:.2f} in {:.2f} seconds\n".format(
+              len(movers), ret, stopTime - startTime))
         self._infoString += _ReportTiming(self._verbosity, "optimize cliques (coarse)")
 
         # Do fine optimization on the Movers.  This is done independently for
@@ -2006,7 +2013,7 @@ END
   global _DoCliqueOptimizationInC
 
   print('Testing Optimizer')
-  opt = Optimizer(probePhil, True, model, modelIndex = 0, altID = None,
+  opt = Optimizer(probePhil, True, model, modelIndex = None, altID = None,
                 bondedNeighborDepth = 4,
                 useNeutronDistances = False,
                 minOccupancy = 0.02,
@@ -2104,7 +2111,7 @@ END
   # Optimization will place the movers. Make sure we got as many as we expected.
   # Make sure that the orientation for all of the movers is correct.
   probePhil = _philLike()
-  opt = Optimizer(probePhil, True, model, modelIndex = 0, altID = None,
+  opt = Optimizer(probePhil, True, model, modelIndex = None, altID = None,
                 bondedNeighborDepth = 4,
                 useNeutronDistances = False,
                 minOccupancy = 0.02,

@@ -376,23 +376,25 @@ class manager(object):
     self.fmodel.update_xray_structure(
       xray_structure = self.model.get_xray_structure(),
       update_f_calc  = False)
-    #N.B. essential that 'use_all_data = False' so only working reflections are used
     if self.verbose > 0:
       silent = False
     else: silent = True
     #
     from cctbx import maptbx
-    e_map = self.fmodel.electron_density_map()
+    e_map = self.fmodel.electron_density_map_for_model_building()
     crystal_symmetry = self.fmodel.xray_structure.crystal_symmetry()
     crystal_gridding = maptbx.crystal_gridding(
       unit_cell        = crystal_symmetry.unit_cell(),
       space_group_info = crystal_symmetry.space_group_info(),
       symmetry_flags   = maptbx.use_space_group_symmetry,
       step             = 0.6)
+    # working reflections only, so that the free set does not guide where
+    # waters go (the twin map ignores exclude_free_r_reflections)
     coeffs = e_map.map_coefficients(
       map_type     = map_type,
       fill_missing = False,
-      isotropize   = True)
+      isotropize   = True,
+      exclude_free_r_reflections = True)
     fft_map = coeffs.fft_map(crystal_gridding = crystal_gridding)
     fft_map.apply_sigma_scaling()
     map_data = fft_map.real_map_unpadded()
