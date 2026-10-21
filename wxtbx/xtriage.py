@@ -317,9 +317,7 @@ def DrawStatusLightControl(parent, message, name, level):
   dc.SelectObject(bmp)
   gc = wx.GraphicsContext.Create(dc)
   dc.Clear()
-  if (level < 0): # of interest, not a problem
-    gc.SetBrush(wx.Brush((0,128,255)))
-  elif (level == 0):
+  if (level == 0):
     gc.SetBrush(wx.Brush((0,255,0)))
   elif (level == 1):
     gc.SetBrush(wx.Brush((255,255,0)))
