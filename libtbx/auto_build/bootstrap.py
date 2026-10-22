@@ -2600,7 +2600,7 @@ class StarbaseBuilder(PhenixBuilder):
   library_action = None
   def add_refresh(self):
     super(StarbaseBuilder, self).add_refresh()
-    args = ["phasertng.isostructure.library.action=%s" % self.library_action,
+    args = ["phasertng.isostructure.action=%s" % self.library_action,
             "phasertng.threads.number=%s" % self.nproc,
             "phasertng.suite.database=%s" % os.path.join(_BUILD_DIR, 'phasertng_starbase', 'run')]
     if self.pdb_mirror is not None:
