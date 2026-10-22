@@ -2616,11 +2616,11 @@ class StarbaseRebuildBuilder(StarbaseBuilder):
   # the library from a local PDB mirror, no network
   library_action = 'rebuild'
 
-class StarbaseUpdateNewBuilder(StarbaseBuilder):
-  library_action = 'update_new'
+class StarbaseUpdatePdbNewBuilder(StarbaseBuilder):
+  library_action = 'update_pdb_new'
 
-class StarbaseUpdateNewAndReversionedBuilder(StarbaseBuilder):
-  library_action = 'update_new_and_reversioned'
+class StarbaseUpdatePdbNewAndReversionedBuilder(StarbaseBuilder):
+  library_action = 'update_pdb_new_and_reversioned'
 
 class PhenixExternalRegression(PhenixBuilder):
   EXTERNAL_CODEBASES = [
@@ -2906,8 +2906,8 @@ def run(root=None):
     'qrefine': QRBuilder,
     'phaser': PhaserBuilder,
     'starbase_rebuild': StarbaseRebuildBuilder,
-    'starbase_update_new': StarbaseUpdateNewBuilder,
-    'starbase_update_new_and_reversioned': StarbaseUpdateNewAndReversionedBuilder,
+    'starbase_update_pdb_new': StarbaseUpdatePdbNewBuilder,
+    'starbase_update_pdb_new_and_reversioned': StarbaseUpdatePdbNewAndReversionedBuilder,
   }
 
   wrapper = textwrap.TextWrapper(width=80, initial_indent='  ',
