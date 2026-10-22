@@ -1005,12 +1005,6 @@ class phasertng_regression_module(SourceModule):
                'git@gitlab.developers.cam.ac.uk:scm/haematology/readgroup/phasertng_regression.git',
                'https://gitlab.developers.cam.ac.uk/scm/haematology/readgroup/phasertng_regression.git']
 
-class phasertng_data_module(SourceModule):
-  module = 'phasertng_data'
-  anonymous = ['git',
-               'git@gitlab.developers.cam.ac.uk:scm/haematology/readgroup/phasertng_data.git',
-               'https://gitlab.developers.cam.ac.uk/scm/haematology/readgroup/phasertng_data.git']
-
 # DIALS repositories
 class labelit_module(SourceModule):
   module = 'labelit'
@@ -1164,7 +1158,9 @@ class Builder(object):
       use_conda=None,
       python='27',
       no_boost_src=False,
+      pdb_mirror=None,
     ):
+    self.pdb_mirror = pdb_mirror
     if nproc is None:
       self.nproc=1
     else:
@@ -1439,7 +1435,7 @@ class Builder(object):
       raise Exception('Unknown access method: %s %s'%(method, str(parameters)))
 
     # add git-lfs steps if needed (should move into Toolbox class)
-    git_lfs_modules = ['phenix_examples', 'phenix_regression', 'chem_data', 'phasertng', 'phasertng_data']
+    git_lfs_modules = ['phenix_examples', 'phenix_regression', 'chem_data', 'phasertng']
     if module in git_lfs_modules:
       # prepend path for check
       dev_env = os.path.join('.', 'dev_env', 'bin')
@@ -2438,7 +2434,6 @@ class PhenixBuilder(CCIBuilder):
     'king',
     'phaser',
     'phasertng',
-    'phasertng_data',
     'phasertng_regression',
     'phaser_regression',
     'voyager_regression',
@@ -2461,7 +2456,6 @@ class PhenixBuilder(CCIBuilder):
     'reel',
     'phaser',
     'phasertng',
-    'phasertng_data',
     'phasertng_regression',
     'phaser_regression',
     'voyager_regression',
@@ -2601,16 +2595,32 @@ class PhenixMolstarBuilder(PhenixBuilder):
         description='molstar adaptbx install script',
       ))
 
-class VoyagerBuilder(PhenixBuilder):
-  # phenix, then the isostructure library of phasertng_data built last, as it takes hours
+class StarbaseBuilder(PhenixBuilder):
+  # phenix, then one action on the isostructure library of phasertng, last as it takes hours
+  library_action = None
   def add_refresh(self):
-    super(VoyagerBuilder, self).add_refresh()
+    super(StarbaseBuilder, self).add_refresh()
+    args = ["phasertng.isostructure.library.action=%s" % self.library_action,
+            "phasertng.threads.number=%s" % self.nproc,
+            "phasertng.suite.database=%s" % os.path.join(_BUILD_DIR, 'phasertng_starbase', 'run')]
+    if self.pdb_mirror is not None:
+      args.append("phasertng.mirrors.offline=%s" % self.pdb_mirror)
     self.add_command(
-      'phasertng.isostructure_data',
-      args=["isostructure_data.nproc=%s" % self.nproc],
-      name='phasertng.isostructure_data',
+      'phasertng.starbase',
+      args=args,
+      name='phasertng.starbase %s' % self.library_action,
       workdir=['.'],
     )
+
+class StarbaseRebuildBuilder(StarbaseBuilder):
+  # the library from a local PDB mirror, no network
+  library_action = 'rebuild'
+
+class StarbaseUpdateNewBuilder(StarbaseBuilder):
+  library_action = 'update_new'
+
+class StarbaseUpdateNewAndReversionedBuilder(StarbaseBuilder):
+  library_action = 'update_new_and_reversioned'
 
 class PhenixExternalRegression(PhenixBuilder):
   EXTERNAL_CODEBASES = [
@@ -2895,7 +2905,9 @@ def run(root=None):
     'molprobity':MOLPROBITYBuilder,
     'qrefine': QRBuilder,
     'phaser': PhaserBuilder,
-    'voyager': VoyagerBuilder
+    'starbase_rebuild': StarbaseRebuildBuilder,
+    'starbase_update_new': StarbaseUpdateNewBuilder,
+    'starbase_update_new_and_reversioned': StarbaseUpdateNewAndReversionedBuilder,
   }
 
   wrapper = textwrap.TextWrapper(width=80, initial_indent='  ',
@@ -3034,6 +3046,12 @@ available. This flag only affects the "update" step. DEPRECATED: the Boost
 installation in the conda environment should be used.""",
                       action="store_true",
                       default=True)
+  parser.add_argument("--pdb-mirror", "--pdb_mirror",
+                      dest="pdb_mirror",
+                      help="""A local mirror of the wwPDB mmCIF archive, required by
+--builder=starbase_rebuild, which builds the isostructure library from it with no
+network.""",
+                      default=None)
   parser.add_argument("--build-dir",
                      dest="build_dir",
                      help="directory where the build will be. Should be at the same level as modules! default is 'build'",
@@ -3084,6 +3102,12 @@ installation in the conda environment should be used.""",
   # Check builder
   if options.builder not in builders:
     raise ValueError("Unknown builder: %s"%options.builder)
+  if options.builder == 'starbase_rebuild':
+    if options.pdb_mirror is None or not os.path.isdir(options.pdb_mirror):
+      raise ValueError("--builder=starbase_rebuild needs --pdb-mirror=<local PDB mirror>: %s" % options.pdb_mirror)
+    options.pdb_mirror = os.path.abspath(options.pdb_mirror)
+  elif options.pdb_mirror is not None:
+    raise ValueError("--pdb-mirror is for --builder=starbase_rebuild")
 
   auth = { 'git_ssh': options.git_ssh, 'git_reference': options.git_reference }
   if options.cciuser:
@@ -3125,6 +3149,7 @@ installation in the conda environment should be used.""",
     use_conda=options.use_conda,
     python=options.python,
     no_boost_src=options.no_boost_src,
+    pdb_mirror=options.pdb_mirror,
   ).run()
   print("\nBootstrap success: %s" % ", ".join(actions))
 
