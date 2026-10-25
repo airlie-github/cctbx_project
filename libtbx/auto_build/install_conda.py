@@ -163,6 +163,7 @@ class conda_manager(object):
     'phenix': phenix_env,
     'phenix_discamb': phenix_env,
     'phenix_molstar': phenix_env,
+    'phenix_voyager': phenix_env,
     'phenix_release': phenix_env,
     'starbase_rebuild': phenix_env,
     'starbase_update_pdb_new': phenix_env,
