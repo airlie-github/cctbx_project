@@ -127,14 +127,18 @@ def exercise_viewer_draws_the_picture():
     viewer = _shown(SvgViewer(), 300, 600)
     assert viewer.load(_svg_file(tmp))
     assert viewer.windowTitle() == "tree.svg"
-    viewer.view.full_size()
+    # fitted, so the whole picture is on screen; every pixel is looked at,
+    # as the line is thinner than any sampling step
     image = viewer.view.grab().toImage()
-    colours = set()
-    for x in range(0, image.width(), 4):
-      for y in range(0, image.height(), 4):
-        colours.add(image.pixel(x, y))
-    # the white background and at least the orange node and the black line
-    assert len(colours) >= 3
+    white = orange = black = False
+    for x in range(image.width()):
+      for y in range(image.height()):
+        c = image.pixelColor(x, y)
+        r, g, b = c.red(), c.green(), c.blue()
+        white = white or (r > 240 and g > 240 and b > 240)
+        orange = orange or (r > 200 and 100 < g < 200 and b < 60)
+        black = black or (r < 60 and g < 60 and b < 60)
+    assert white and orange and black, (white, orange, black)
   finally:
     shutil.rmtree(tmp)
 
