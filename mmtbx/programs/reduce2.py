@@ -25,6 +25,7 @@ from libtbx.utils import Sorry, null_out, peak_memory_usage, human_readable_size
 import mmtbx
 from mmtbx.probe import Helpers
 from iotbx import pdb, cli_parser
+from iotbx.pdb import altloc_completion
 from mmtbx.hydrogens import reduce_hydrogen
 from mmtbx.hydrogens import hd_exchange
 from mmtbx.hydrogens import capping
@@ -142,7 +143,12 @@ qmready = False
   .short_caption = Run with custom preset options suitable for QM
   .help = Add H to water, use longer XH distances, add OXT and terminal NH3 at all chain ends and breaks, \
           and the terminal hydroxyl H of nucleic acids (HO3-prime at a 3-prime end, HO5-prime at a \
-          5-prime OH end)
+          5-prime OH end). Also complete residues whose conformers lack atoms \
+          their other conformers have (altloc completion), and regularize the \
+          geometry of the finished model: bond outliers and clashes are \
+          minimized away with the smallest shift of the atoms \
+          (mmtbx.model.manager.regularize_geometry), before the clash check and \
+          the caps
 capping = False
   .type = bool
   .short_caption = Cap dangling bonds with H
@@ -1031,7 +1037,10 @@ NOTES:
   residue gets no H. Cannot be combined with approach=remove or qmready=True.
 
   qmready=True prepares a model for QM: H on water, longer XH distances, OXT and NH3+ at
-  chain ends and breaks, HO3' and HO5' at nucleic-acid chain ends. Adding capping=True to it also puts H on every non-H atom left with
+  chain ends and breaks, HO3' and HO5' at nucleic-acid chain ends, and the geometry of the
+  finished model regularized: bond outliers and clashes minimized away with the smallest
+  shift (mmtbx.model.manager.regularize_geometry), before the clash check and the caps.
+  Adding capping=True to it also puts H on every non-H atom left with
   an unsatisfied valence by a missing non-H atom (truncated side chains, incomplete ligands),
   as the very last step; the capped model is for QM use only, because the cap names are
   unknown to the restraint libraries.
@@ -1224,6 +1233,7 @@ NOTES:
       raise Sorry("Insufficient restraints were found for the following atoms:"+bad)
 
     self.model = reduce_add_h_obj.get_model()
+    self._placement_renames = reduce_add_h_obj.renamed_symmetric_atoms
     # input pairs keep their values per site when placement renamed their H
     self._hd_records = hd_exchange.rekey_records(self._hd_records,
       reduce_add_h_obj.renamed_existing_h)
@@ -1331,6 +1341,55 @@ NOTES:
     text = '\n'.join(lines) + '\n'
     print(text, file=self.logger)
     return text
+
+# ------------------------------------------------------------------------------
+
+  def _RenamesText(self, renames):
+    # IUPAC renaming of symmetric side-chain atoms; 'none' if renames is
+    # empty. Printed here, the list capped at 20 unless verbosity > 2.
+    # :param renames: As reduce_hydrogen.symmetric_renames().
+    # :return: The description-file text, with the full list.
+    n_models = len(self.model.get_hierarchy().models())
+    residues = set(r.residue for r in renames)
+    lines = []
+    for r in renames:
+      label = r.label
+      if r.altloc.strip():
+        label += ' altloc %s' % r.altloc
+      if n_models > 1:
+        label += ' (model %s)' % r.model
+      lines.append('  %s: %s' % (label, ', '.join('%s/%s' % p for p in r.pairs)))
+    title = 'IUPAC renaming of symmetric side-chain atoms: '
+    if not renames:
+      text = '\n' + title + 'none\n\n'
+      print(text, file=self.logger)
+      return text
+    title += ('%d residue(s) (the names of equivalent atoms are exchanged)'
+      % len(residues))
+    shown = lines
+    if self.params.verbosity <= 2 and len(lines) > 20:
+      shown = lines[:20] + ['  (+%d more)' % (len(lines) - 20)]
+    print('\n' + '\n'.join([title] + shown) + '\n', file=self.logger)
+    return '\n' + '\n'.join([title] + lines) + '\n\n'
+
+# ------------------------------------------------------------------------------
+
+  def _NetRenames(self):
+    # Input to output: renames of the input's processing (restraint files)
+    # followed by placement's; a second swap of a pair undoes the first
+    # (flip_symmetric_amino_acids() can do that near chi +-90).
+    net = {}
+    for r in self._input_renames + self._placement_renames:
+      key = (r.residue, r.altloc)
+      if key not in net:
+        net[key] = group_args(model=r.model, residue=r.residue, label=r.label,
+          altloc=r.altloc, pairs=[])
+      for p in r.pairs:
+        if p in net[key].pairs:
+          net[key].pairs.remove(p)
+        else:
+          net[key].pairs.append(p)
+    return [r for r in net.values() if r.pairs]
 
 # ------------------------------------------------------------------------------
 
@@ -1888,6 +1947,34 @@ NOTES:
 
 # ------------------------------------------------------------------------------
 
+  def _RegularizeGeometry(self, model):
+    # qmready=True: bond outliers and clashes of the finished model are
+    # minimized away with the smallest shift (regularize_geometry(), riding
+    # H), on the rebuilt copy with restraints, before the clash check and
+    # the caps. The coordinates go back to self.model (the same atoms in the
+    # same order), the output model with capping=False.
+    # :param model: The rebuilt copy of self.model with restraints; its
+    # coordinates change.
+    # :return: The description-file text; also in the log.
+    from six.moves import cStringIO as StringIO
+    report = StringIO()
+    model.set_log(report)
+    r = model.regularize_geometry()
+    model.set_log(null_out())
+    if not r.needed:
+      text = ('qmready: geometry regularization not needed (no bond outliers '
+        'or clashes)\n')
+    else:
+      text = report.getvalue()
+      atoms = self.model.get_atoms()
+      qm_atoms = model.get_atoms()
+      assert atoms.size() == qm_atoms.size()
+      for a, qm_a in zip(atoms, qm_atoms):
+        assert a.id_str() == qm_a.id_str(), (a.id_str(), qm_a.id_str())
+      self.model.set_sites_cart(model.get_sites_cart())
+    print(text, file=self.logger)
+    return '\n' + text
+
   def _CheckQmreadyClashes(self, model):
     # qmready=True: Sorry if the finished model has a non-bonded contact
     # below 1.0 A. Checked on a copy with restraints (self.model has none);
@@ -1979,6 +2066,37 @@ NOTES:
           base, str(self.total_charge))
 
 # ------------------------------------------------------------------------------
+
+  def _AltlocCompletionText(self):
+    # qmready=True: the Altloc completion section of the description file,
+    # the lines printed to the log after complete_altlocs().
+    # :return: The description-file text ('' if nothing was reported).
+    lines = altloc_completion.report_lines(self._altloc_completion)
+    if not lines: return ''
+    lines = ['', 'Altloc completion (atoms borrowed between conformers of a '
+      'residue):'] + ['  ' + line for line in lines]
+    return '\n'.join(lines) + '\n'
+
+  def _HNotPlacedText(self, model):
+    # qmready=True: the residues of the finished model that miss H. reduce2
+    # does not place a rotatable H on a shared atom whose bonded partners
+    # carry altlocs (TYR HH on a blank OH with CZ A/B). Residues that miss
+    # non-H atoms (truncated, capping=True) are listed by the atom-complete
+    # check instead.
+    # :param model: The finished model with restraints, not yet capped.
+    # :return: The description-file text ('' if none); also in the log.
+    heavy = model.missing_atoms_by_residue()
+    lines = []
+    for k, v in model.missing_atoms_by_residue(include_hydrogens=True).items():
+      if k in heavy: continue
+      lines.append('  %s: %s' % (k, ' '.join(v)))
+    if not lines: return ''
+    lines = ['qmready: H not placed (a rotatable H on a shared atom whose '
+      'partners carry altlocs; place by hand or wait for the reduce2 fix):'
+      ] + lines
+    text = '\n'.join(lines) + '\n'
+    print(text, file=self.logger)
+    return '\n' + text
 
   def _CapDanglingAtoms(self, model, r):
     # capping=True: the output model and the Capping report after
@@ -2276,6 +2394,8 @@ NOTES:
     # residues without restraints (optimize, D input): None until checked
     self._unrestrained = None
     self._auto_restraint_names = []
+    # qmready: the complete_altlocs() result, for the description
+    self._altloc_completion = None
 
     # String describing the run that will be output to the specified file.
     outString = 'reduce2 v.{}, run {}\n'.format(version, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -2330,6 +2450,16 @@ NOTES:
     if self.params.qmready:
       # add OXT
       self.model.add_terminal_oxt()
+      # residues with partial alternative conformations: borrow the atoms
+      # their conformers lack from each other. An ambiguous borrow is a Sorry
+      completion = self.model.complete_altlocs()
+      self._altloc_completion = completion
+      lines = altloc_completion.report_lines(completion)
+      if lines:
+        print("Altloc completion (atoms borrowed between conformers of a residue):",
+          file=self.logger)
+        for line in lines:
+          print("  " + line, file=self.logger)
       # make sure model is atom-complete. With capping=True a listing only:
       # the atoms left with a dangling bond are capped at the end
       if not self.model.is_atom_complete():
@@ -2343,9 +2473,20 @@ NOTES:
         print("capping=True: continuing, dangling bonds are capped with H at the end",
           file=self.logger)
 
+    self._input_renames = []
+    self._placement_renames = []
     if self.data_manager.has_restraints():
       self.model.set_stop_for_unknowns(self.params.stop_on_any_missing_hydrogen)
+      # default interpretation parameters: renames symmetric side-chain atoms
+      sites_before = reduce_hydrogen.atom_group_sites(self.model.get_hierarchy())
       self.model.process(make_restraints=False)
+      self._input_renames = reduce_hydrogen.symmetric_renames(sites_before,
+        self.model.get_hierarchy())
+      if self.params.model_id is not None:
+        selected = _SelectModelNumber(self.model.get_hierarchy(),
+          self.params.model_id).id.strip()
+        self._input_renames = [r for r in self._input_renames
+          if r.model == selected]
 
     # If we've been asked to only to a single model from the file, strip the model down to
     # only that one (checked in validate()); it keeps its MODEL number.
@@ -2412,6 +2553,7 @@ NOTES:
       make_sub_header('Adding Hydrogens', out=self.logger)
       startAdd = time.time()
       self._AddHydrogens()
+      outString += self._RenamesText(self._NetRenames())
       outString += self._dod_renamed_note
       outString += self._unknown_atoms_note
       outString += self._metal_thiol_note
@@ -2430,6 +2572,7 @@ NOTES:
         startAdd = time.time()
         self._AddHydrogens()
         doneAdd = time.time()
+        outString += self._RenamesText(self._NetRenames())
         outString += self._dod_renamed_note
         outString += self._unknown_atoms_note
         outString += self._metal_thiol_note
@@ -2441,6 +2584,7 @@ NOTES:
         # (normalized input was rebuilt with them)
         if not self._normalized_with_restraints:
           self._ReinterpretModel(make_restraints=True)
+        outString += self._RenamesText(self._NetRenames())
         outString += self._UnchangedText()
         # atom names not in the dictionary, as placement reports them
         self._unknown_atoms = reduce_hydrogen.atoms_not_in_dictionary(
@@ -2557,6 +2701,8 @@ NOTES:
       # Own path, independent of the isotope logic: any H/D layout, no
       # matcher, keep_existing_H ignored
       make_sub_header('Removing Hydrogens', out=self.logger)
+      if self._input_renames:
+        outString += self._RenamesText(self._input_renames)
       sel = self.model.selection("element H or element D")
       for a in self.model.get_atoms():
         if sel[a.i_seq]:
@@ -2582,17 +2728,22 @@ NOTES:
     # generating mmCIF files, so we always do it for safety.
     self.model = self._FinalizeModel(self.model.get_hierarchy())
 
-    # qmready=True (remove adds no H): one copy with restraints for the clash
-    # check (the finished model must be clash-free), the dangling atoms
-    # (capping=True) and the total charge, as qr.finalise does with
-    # calculate_charge=True, added to the default output file name
-    # (approach=add). With capping=True the caps go on that copy as the
-    # last change to the hierarchy and it is the output model.
+    # qmready=True (remove adds no H): one copy with restraints for the
+    # geometry regularization (bond outliers and clashes minimized away with
+    # the smallest shift), the clash check (the finished model must be
+    # clash-free), the dangling atoms (capping=True) and the total charge, as
+    # qr.finalise does with calculate_charge=True, added to the default
+    # output file name (approach=add). With capping=True the caps go on that
+    # copy as the last change to the hierarchy and it is the output model.
     self.total_charge = None
+    if self.params.qmready:
+      outString += self._AltlocCompletionText()
     if self.params.qmready and self.params.approach != 'remove':
       qm_model = self._RebuildModel(self.model.get_hierarchy().deep_copy(),
         make_restraints=True)
+      outString += self._RegularizeGeometry(qm_model)
       self._CheckQmreadyClashes(qm_model)
+      outString += self._HNotPlacedText(qm_model)
       if self.params.capping:
         # capping.cap_model: the records, the charge of the capped model
         # (the caps as sigma bonds) and the caps, shared with qrefine
@@ -2840,6 +2991,7 @@ NOTES:
 
           # Rerun hydrogen placement.
           self._AddHydrogens()
+          self._RenamesText(self._placement_renames)
 
           # Run optimization, locking the specified Amides into each configuration.
           # Don't do fixup on the ones that are locked down.  Make sure that we can
@@ -2962,6 +3114,7 @@ NOTES:
 
           # Rerun hydrogen placement.
           self._AddHydrogens()
+          self._RenamesText(self._placement_renames)
 
           # Run optimization, locking the specified Histidines into each configuration.
           # Don't do fixup on the ones that are locked down.  Make sure that we can
