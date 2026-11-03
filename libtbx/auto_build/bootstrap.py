@@ -2604,7 +2604,7 @@ class StarbaseBuilder(PhenixBuilder):
             "phasertng.threads.number=%s" % self.nproc,
             "phasertng.suite.database=%s" % os.path.join(_BUILD_DIR, 'phasertng_starbase', 'run')]
     if self.pdb_mirror is not None:
-      args.append("phasertng.mirrors.offline=%s" % self.pdb_mirror)
+      args.append("phasertng.mirrors.offline_directory=%s" % self.pdb_mirror)
     self.add_command(
       'phasertng.starbase',
       args=args,
