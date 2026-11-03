@@ -9,7 +9,9 @@
 #include <cctbx/xray/targets/llgi.h>
 #include <cctbx/xray/targets/llgi_e.h>
 #include <cctbx/xray/targets/llgi_exact.h>
+#include <cctbx/xray/targets/wilson_intensity.h>
 #include <boost/python/class.hpp>
+#include <boost/python/def.hpp>
 #include <boost/python/args.hpp>
 #include <boost/python/docstring_options.hpp>
 #include <boost/python/return_value_policy.hpp>
@@ -444,6 +446,47 @@ namespace {
     }
   };
 
+  struct wilson_intensity_wrappers
+  {
+    static void
+    wrap()
+    {
+      using namespace boost::python;
+      {
+        typedef wilson_intensity::evaluate_many w_t;
+        class_<w_t>("wilson_intensity", no_init)
+          .def(init<
+            af::const_ref<double> const&,
+            af::const_ref<double> const&,
+            af::const_ref<double> const&,
+            af::const_ref<bool> const&>((
+              arg("i_obs"),
+              arg("sig_i_obs"),
+              arg("sigma"),
+              arg("centric_flags"))))
+          .add_property("log_likelihood", make_getter(&w_t::log_likelihood, return_value_policy<return_by_value>()))
+          .add_property("d_ll_d_ln_sigma", make_getter(&w_t::d_ll_d_ln_sigma, return_value_policy<return_by_value>()))
+          .add_property("d2_ll_d_ln_sigma2", make_getter(&w_t::d2_ll_d_ln_sigma2, return_value_policy<return_by_value>()))
+        ;
+      }
+      {
+        def("wilson_intensity_tail_probability", &tail_probability,
+          (arg("i_obs"), arg("sig_i_obs"), arg("sigma"), arg("centric_flags")));
+      }
+    }
+
+    static af::shared<double>
+    tail_probability(
+      af::const_ref<double> const& i_obs,
+      af::const_ref<double> const& sig_i_obs,
+      af::const_ref<double> const& sigma,
+      af::const_ref<bool> const& centric_flags)
+    {
+      return wilson_intensity::tail_probability_many(
+        i_obs, sig_i_obs, sigma, centric_flags).probability;
+    }
+  };
+
   struct llgi_exact_wrappers
   {
     static void
@@ -477,11 +520,27 @@ namespace {
               arg("sigmaa"),
               arg("centric_flags"),
               arg("null_log_z"))))
+          .def(init<
+            af::const_ref<double> const&,
+            af::const_ref<double> const&,
+            af::const_ref<double> const&,
+            af::const_ref<double> const&,
+            af::const_ref<bool> const&,
+            af::const_ref<double> const&,
+            bool>((
+              arg("e_obs_sq"),
+              arg("sig_e_obs_sq"),
+              arg("e_calc"),
+              arg("sigmaa"),
+              arg("centric_flags"),
+              arg("null_log_z"),
+              arg("phase_error"))))
           .add_property("ll", make_getter(&w_t::ll, return_value_policy<return_by_value>()))
           .add_property("d_ll_d_ec", make_getter(&w_t::d_ll_d_ec, return_value_policy<return_by_value>()))
           .add_property("d_ll_d_a", make_getter(&w_t::d_ll_d_a, return_value_policy<return_by_value>()))
           .add_property("e_expected", make_getter(&w_t::e_expected, return_value_policy<return_by_value>()))
           .add_property("e_abs_expected", make_getter(&w_t::e_abs_expected, return_value_policy<return_by_value>()))
+          .add_property("phase_error", make_getter(&w_t::phase_error, return_value_policy<return_by_value>()))
         ;
       }
       {
@@ -589,6 +648,7 @@ namespace boost_python {
     targets::boost_python::llgi_sigmaa_scatfrac_wrappers::wrap();
     targets::boost_python::llgi_e_sigmaa_wrappers::wrap();
     targets::boost_python::llgi_exact_wrappers::wrap();
+    targets::boost_python::wilson_intensity_wrappers::wrap();
     targets::boost_python::r_factor_wrappers::wrap();
   }
 

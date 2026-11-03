@@ -4,6 +4,20 @@ description: Run GuidedCoding for an explicitly chosen coding task, or guide pro
 disable-model-invocation: true
 ---
 
+> **Retired (2026-10-23).** This is the earlier GuidedCoding kit, kept only for reference. The current
+> GuidedCoding is at https://github.com/cctbx/guided_coding (branch `master`). When this skill is invoked, start no
+> job. Before reading or running anything, first tell the user in one sentence that this kit is retired and that you
+> can move them to the current GuidedCoding in one step. To do it:
+> read the reviewed README at https://raw.githubusercontent.com/cctbx/guided_coding/22dcdc035feefe0f4330e2905aaf40d5a2a3a430/README.md (that
+> fixed commit, not `master`) and take its "PHENIX developers" install block. That block installs the latest
+> GuidedCoding from `master` into the installation's `modules/guided_coding`, checks that it is version 1.4, and
+> replaces this kit's registration with the new one; say so to the user. If that page cannot
+> be read, or has no such block, stop and point to the README instead. Show the block, say in plain words what it
+> will change, and ask once. If the user
+> agrees, run it exactly as written with bash, with `$PHENIX` set or from the folder that contains `modules` (the
+> folder above `cctbx_project`), and report its output. Then tell the user to start a new Claude Code conversation
+> and type `/gc`. Continue with the earlier kit only if the user asks you to.
+
 # GuidedCoding, by explicit request
 
 The user's task is: $ARGUMENTS
@@ -41,7 +55,7 @@ cd /absolute/path/to/libtbx/guided_coding &&
 if command -v shasum >/dev/null 2>&1; then shasum -a 256 -c SOURCE_MANIFEST.sha256; else sha256sum -c SOURCE_MANIFEST.sha256; fi &&
 GC_PAYLOAD_ROOT="$(pwd -P)/payload" libtbx.python -I -B payload/tools/screen_check.py verify-source . &&
 cat payload/RELEASE &&
-grep -Eq '^guided_coding 2\.0 pilot r10 rev19 ' payload/RELEASE
+grep -Eq '^guided_coding 2\.0 pilot r10 rev20 ' payload/RELEASE
 ```
 After changing directory, the listed-hash check must succeed before any
 checker code runs. It uses `shasum` when that command exists and otherwise
@@ -53,7 +67,7 @@ unlisted module in `payload/tools/` from loading during verification.
 A directory, checksum, inventory or release failure returns nonzero and
 stops all dependent work. Only after this block succeeds, read
 `payload/DEVELOPER_GUIDE_CONTRACT.md`.
-This revision requires the release line to begin `guided_coding 2.0 pilot r10 rev19 `
+This revision requires the release line to begin `guided_coding 2.0 pilot r10 rev20 `
 (the label, not a mention of it later in the line); if it does not,
 stop and report the different version before starting a guided change.
 

@@ -169,7 +169,7 @@ class manager_mixin(object):
     maps of the working reflections: posterior_filled, the LLGI posterior
     map with D*Fc for every other reflection (mmtbx.refinement.llgi_maps.
     filled_posterior_map_server); bias_reduced, the LLGI bias-reduced map
-    (bias_reduced_map_server); posterior_2mfo_dfc (or none), the LLGI
+    (bias_reduced_map_server); posterior (or none), the LLGI
     posterior map without them. """
     emap = self.electron_density_map_for_target()
     if(self.llgi_target_active()):
@@ -1563,6 +1563,13 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
         verbose=None,
         log = None):
     self.alpha_beta_cache = None
+    # Auto-shutoff refine_hd_scattering if number of H is too small.
+    if refine_hd_scattering:
+      if self.xray_structure is not None:
+        hd_sel = self.xray_structure.hd_selection()
+        h_fraction = hd_sel.count(True)*100./hd_sel.size()
+        if h_fraction < 25.: refine_hd_scattering = False
+    #
     if(apply_scale_k1_to_f_obs):
       self.apply_scale_k1_to_f_obs()
     from mmtbx.bulk_solvent import f_model_all_scales
@@ -1850,7 +1857,7 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
   def update_llgi_sigmaa_scatfrac(self, params=None, e_params=None,
         refit_tncs=True, pdb_hierarchy=None):
     """ Fit sigmaA and ScatFrac against the current model
-    (mmtbx.refinement.llgi_e_sigmaa.estimate_sigmaa_e_then_scatfrac_f) and
+    (mmtbx.refinement.llgi_e_sigmaa.estimate_sigmaa_and_scatfrac) and
     attach .sigmaa, .sigmaa_curve and .scatfrac to llgi_data. Called by
     the refinement driver once per macrocycle, like update_all_scales(),
     and before the final statistics and maps if llgi_sigmaa_is_current()
@@ -1894,7 +1901,7 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
       return llgi_tncs.fit_and_renormalise(self, scatfrac_params=params,
         e_params=e_params, pdb_hierarchy=pdb_hierarchy)
     f_obs = self.f_obs()
-    result = llgi_e_sigmaa.estimate_sigmaa_e_then_scatfrac_f(
+    result = llgi_e_sigmaa.estimate_sigmaa_and_scatfrac(
       self,
       dobs = llgi_data.dobs.data(),
       feff = llgi_data.feff.data(),
@@ -2643,21 +2650,21 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
       free_reflections_per_bin = free_reflections_per_bin,
       interpolation            = interpolation)
 
-  def map_calculation_helper_llgi(self):
+  def map_calculation_helper_llgi(self, phase_errors=False):
     """ The LLGI counterpart of map_calculation_helper(): .f_obs, .f_model,
     .alpha, .beta and .fom for mmtbx.map_tools.combine, from the LLGI
-    quantities instead of an ML alpha/beta fit. On the E scale, without
-    nacelle's anisotropy or ScatFrac, as for the sigmaA fit:
+    quantities instead of an ML alpha/beta fit. On the E scale, with the
+    model's E as in the target and the sigmaA fit (llgi_e_sigmaa.
+    build_e_model):
       Eeff   = Feff/(sqrt(TEPS)*RESN)
-      Emodel = f_model_no_aniso_scale/sqrt(EPS*SigmaP*A)
-    (A the model's anisotropic factor, llgi_e_sigmaa's model_anisotropy;
-    1 if off)
+      Emodel = k*F_model/(RESN*sqrt(TEPS*ScatFrac))
       D      = Dobs*sigmaA,  V = TEPS - D^2
     combine() forms fo_scale*fom*f_obs + fc_scale*alpha*f_model, with
       .f_model  f_model_no_aniso_scale (the phase of f_model, without
                 k_anisotropic)
-      .alpha    the model coefficient times sqrt(TEPS)*RESN/sqrt(EPS*SigmaP*A),
-                so that alpha*f_model is on the F scale.
+      .alpha    the model coefficient times sqrt(TEPS)*RESN*|Emodel|/
+                |f_model_no_aniso_scale|, so that alpha*f_model is on the
+                F scale.
     For reflections with measured intensities (llgi_data.e_obs_sq), the
     exact posterior is used whether or not the hybrid target is enabled:
       .f_obs    <|E|>*sqrt(TEPS)*RESN,  .fom = <E>/<|E|>,  coefficient sigmaA
@@ -2667,9 +2674,13 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
                 (centric), X = 2*D*Eeff*Emodel/V,  coefficient D
     (fom and alpha 0 where D, V, Eeff or Emodel is not positive).
     Also: .beta = V and .d = D for every reflection (the statistics table),
-    .x, X or its equivalent for the exact fom (phase_errors_llgi()), and
-    .n_exact; .llgi marks the helper for electron_density_map's fill of
-    missing reflections.
+    .x, the Rice form's X, and .n_exact; .llgi marks the helper for
+    electron_density_map's fill of missing reflections. With phase_errors,
+    .phase_error is the expected |phi - phi_model| (degrees) per reflection
+    (else None): the mean over the exact posterior, which, unlike the
+    phase probability implied by its fom (a mean cosine weighted by |E|),
+    includes the uncertainty of |E|, or for the Rice form that of the
+    fom's phase probability.
     With tNCS (llgi_data.tncs_u/tncs_t, TEPS = 1) everything above is in the
     t-normalised frame of mmtbx.refinement.llgi_tncs.frame: sigmaA -> a',
     Emodel -> s*Emodel, and sqrt(t) in place of sqrt(TEPS).
@@ -2692,16 +2703,12 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
     import mmtbx.refinement.llgi_e_sigmaa as llgi_e_sigmaa
     class result(object):
       llgi = True  # tells electron_density_map to fill missing the LLGI way
-      def __init__(self, fmodel):
+      def __init__(self, fmodel, phase_errors):
         feff = llgi_data.feff
         f_obs = fmodel.f_obs()
-        epsilons = f_obs.epsilons().data().as_double()
         fmnas = fmodel.f_model_no_aniso_scale()
-        e_model_result = llgi_e_sigmaa.build_e_model_as_fitted(llgi_data,
-          fmnas.data(), f_obs)
+        e_model_result = llgi_e_sigmaa.build_e_model_as_fitted(fmodel)
         e_model_abs = flex.abs(e_model_result.e_model)
-        # the model's normalisation, with its anisotropy (A = 1 if off)
-        sigma_p = e_model_result.sigma_p * e_model_result.anisotropy
         eeff = llgi_e_sigmaa.build_e_eff(
           feff.data(), llgi_data.resn.data())
         self.f_obs = feff
@@ -2728,8 +2735,9 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
         valid = (sa > 0) & (dobs > 0)
         d = flex.double(n, 0.0)
         d.set_selected(valid, dobs * sa)
-        inv_sqrt_eps_sigmap = s_frame / flex.sqrt(epsilons * sigma_p)
-        alpha_data = d * sqrt_teps * resn * inv_sqrt_eps_sigmap
+        # |Emodel| per |f_model_no_aniso_scale| (in the tNCS frame)
+        e_per_f = s_frame * e_model_result.e_per_f
+        alpha_data = d * sqrt_teps * resn * e_per_f
         v = teps - d * d
         valid = valid & (v > 0)
         valid = valid & (e_model_abs > 0) & (eeff > 0)
@@ -2743,6 +2751,18 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
         fom.set_selected(valid & ~centric_flags, acentric_fom)
         fom.set_selected(valid & centric_flags, centric_fom)
         x = x.set_selected(~valid, 0.0)
+        self.phase_error = None
+        if(phase_errors):
+          # Rice form: the phase probability of the fom, the ML forms of
+          # max_lik with p = X/2
+          one = flex.double(n, 1.0)
+          self.phase_error = max_lik.fom_and_phase_error(
+            f_obs         = x * 0.5,
+            f_model       = one,
+            alpha         = one,
+            beta          = one,
+            epsilons      = one,
+            centric_flags = centric_flags).phase_error()
         # Exact posterior for every measured reflection (see the
         # docstring): one evaluation per reflection, and the Rice figure of
         # merit gives worse maps where the Rice approximation is poor.
@@ -2761,7 +2781,8 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
               e_calc=e_model_abs.select(isel),
               sigmaa=sa.select(isel),
               centric_flags=centric_flags.select(isel),
-              null_log_z=hybrid.null_log_z.select(isel))
+              null_log_z=hybrid.null_log_z.select(isel),
+              phase_error=bool(phase_errors))
             e_abs = r.e_abs_expected
             m_exact = r.e_expected / e_abs.deep_copy().set_selected(
               e_abs <= 0, 1.0)
@@ -2772,15 +2793,9 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
             fom.set_selected(isel, m_exact)
             sa_exact = sa.select(isel)
             alpha_data.set_selected(isel,
-              sa_exact * (sqrt_teps * resn * inv_sqrt_eps_sigmap).select(isel))
-            # X equivalent to m (for phase_errors_llgi)
-            c_ex = centric_flags.select(isel)
-            x_ex = flex.double(isel.size(), 0.0)
-            x_ex.set_selected(~c_ex,
-              scitbx.math.inverse_bessel_i1_over_i0(m_exact.select(~c_ex)))
-            mc = m_exact.select(c_ex)
-            x_ex.set_selected(c_ex, flex.log((1 + mc) / (1 - mc)))
-            x.set_selected(isel, x_ex)
+              sa_exact * (sqrt_teps * resn * e_per_f).select(isel))
+            if(phase_errors):
+              self.phase_error.set_selected(isel, r.phase_error)
             self.n_exact = isel.size()
         self.f_obs = feff.customized_copy(data=f_obs_data)
         self.alpha = feff.array(data=alpha_data)
@@ -2788,29 +2803,20 @@ class manager(manager_mixin, metaclass=libtbx.utils.Tracker):
         self.fom = fom
         self.d = d
         self.x = x
-    return result(fmodel=self)
+    return result(fmodel=self, phase_errors=phase_errors)
 
   def phase_errors_llgi(self, map_calculation_helper_llgi=None):
     """ Expected absolute phase error <|phi - phi_model|> per reflection
-    (degrees), implied by the LLGI (E-scale) figure of merit that the
-    LLGI map coefficients use -- the counterpart of phase_errors(),
-    without the ML alpha/beta fit. Reuses the same Lunin & Skovoroda
-    (1995) formulas: those depend only on p = alpha*Fo*Fm/(eps*beta), and
-    the LLGI fom is I1(X)/I0(X) (acentric) or tanh(X/2) (centric), i.e.
-    the ML forms with p = X/2.
+    (degrees) from the LLGI quantities -- the counterpart of
+    phase_errors(), without the ML alpha/beta fit: the mean over the exact
+    posterior where the LLGI maps use it, otherwise over the phase
+    probability of the Rice fom (map_calculation_helper_llgi with
+    phase_errors; a helper given without them is not reused).
     """
     mch = map_calculation_helper_llgi
-    if(mch is None):
-      mch = self.map_calculation_helper_llgi()
-    p = mch.x * 0.5
-    one = flex.double(p.size(), 1.0)
-    return max_lik.fom_and_phase_error(
-      f_obs         = p,
-      f_model       = one,
-      alpha         = one,
-      beta          = one,
-      epsilons      = one,
-      centric_flags = mch.f_obs.centric_flags().data()).phase_error()
+    if(mch is None or getattr(mch, "phase_error", None) is None):
+      mch = self.map_calculation_helper_llgi(phase_errors=True)
+    return mch.phase_error
 
   def model_error_llgi(self):
     """ Coordinate error (A) from the LLGI sigmaA curve attached to

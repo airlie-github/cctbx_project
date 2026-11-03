@@ -27,43 +27,25 @@ def exercise_requires_llgi_data_and_sigmaa_scatfrac():
 def _independent_e_scale_quantities(fmodel):
   """ The E-scale Eeff, |Emodel|, D, V and scale factors computed without
   the code under test (no build_e_eff/build_e_model or
-  fmodel.f_model_no_aniso_scale()), as flex.double arrays on
-  fmodel.f_obs()'s index set: (eeff, emodel_abs, d, v, sqrt_teps_resn,
-  inv_sqrt_eps_sigmap).
+  fmodel.f_model_no_aniso_scale()), from the target's normalisation (the
+  ScatFrac attached by the fit), as flex.double arrays on fmodel.f_obs()'s
+  index set: (eeff, emodel_abs, d, v, sqrt_teps_resn, e_per_f), e_per_f =
+  |Emodel|/|F_model/k_anisotropic|.
   """
   llgi_data = fmodel.llgi_data()
-  f_obs = fmodel.f_obs()
   feff = llgi_data.feff.data()
   resn = llgi_data.resn.data()
   teps = llgi_data.teps.data()
   dobs = llgi_data.dobs.data()
   sa = llgi_data.sigmaa.data()
-  epsilons = f_obs.epsilons().data().as_double()
-  d_star_sq = f_obs.d_star_sq().data()
-
-  # f_model_no_aniso_scale, independently: f_model()/k_anisotropic().
-  # flex does not support complex_double / double directly.
-  f_model_data = fmodel.f_model().data()
+  scatfrac = llgi_data.scatfrac.data()
+  k = fmodel.scale_ml_wrapper()
   k_aniso = fmodel.k_anisotropic()
-  fmnas = f_model_data * (1.0 / k_aniso)
-
-  # SigmaP as a fixed-bandwidth Gaussian-kernel average of |fmnas|^2 in
-  # d*^2 (no epsilon): simpler than build_sigma_p, so it agrees only to
-  # about 15%.
-  intensity = flex.norm(fmnas)
-  d_star_sq_np = d_star_sq.as_numpy_array()
-  import numpy as np
-  bandwidth = (d_star_sq_np.max() - d_star_sq_np.min()) / 15.0
-  intensity_np = intensity.as_numpy_array()
-  sigma_p_np = np.empty(d_star_sq_np.size)
-  for i0 in range(0, d_star_sq_np.size, 500):  # blocks of rows, bounded memory
-    x0 = d_star_sq_np[i0:i0 + 500, None]
-    w = np.exp(-0.5 * ((d_star_sq_np[None, :] - x0) / bandwidth) ** 2)
-    sigma_p_np[i0:i0 + 500] = w.dot(intensity_np) / w.sum(axis=1)
-  sigma_p = flex.double(sigma_p_np)
-
+  # the target's Ecalc = k F_model/(RESN sqrt(TEPS ScatFrac))
+  e_per_f = k * k_aniso / (resn * flex.sqrt(teps * scatfrac))
   eeff = feff / (flex.sqrt(teps) * resn)
-  emodel_abs = flex.abs(fmnas) / flex.sqrt(epsilons * sigma_p)
+  emodel_abs = flex.abs(fmodel.f_model().data()) * k / (
+    resn * flex.sqrt(teps * scatfrac))
   valid = (sa > 0) & (dobs > 0)
   n = feff.size()
   d = flex.double(n, 0.0)
@@ -71,24 +53,17 @@ def _independent_e_scale_quantities(fmodel):
   v = teps - d * d
   sqrt_teps_resn = flex.sqrt(
     teps.deep_copy().set_selected(teps <= 0, 1.0)) * resn
-  inv_sqrt_eps_sigmap = 1.0 / flex.sqrt(epsilons * sigma_p)
-  return eeff, emodel_abs, d, v, sqrt_teps_resn, inv_sqrt_eps_sigmap
+  return eeff, emodel_abs, d, v, sqrt_teps_resn, e_per_f
 
 def exercise_alpha_matches_d_formula():
-  # .alpha = D*sqrt(TEPS)*RESN/sqrt(EPS*SigmaP), D = Dobs*sigmaA, against
-  # the independent quantities above.
+  # .alpha = D*sqrt(TEPS)*RESN*|Emodel|/|F_model/k_anisotropic|, D =
+  # Dobs*sigmaA, against the independent quantities above.
   fmodel = build_llgi_fmodel(60, 1.9, seed=13)
   mch = fmodel.map_calculation_helper_llgi()
-  eeff, emodel_abs, d, v, sqrt_teps_resn, inv_sqrt_eps_sigmap = \
+  eeff, emodel_abs, d, v, sqrt_teps_resn, e_per_f = \
     _independent_e_scale_quantities(fmodel)
-  alpha_expected = d * sqrt_teps_resn * inv_sqrt_eps_sigmap
-  # 15%: the independent SigmaP differs by that much; a wrong factor
-  # (D, RESN, SigmaP exponent) gives an order-of-magnitude error.
-  actual = list(mch.alpha.data())
-  expected = list(alpha_expected)
-  for a, e in zip(actual, expected):
-    rel_diff = abs(a - e) / max(abs(e), 1.e-6)
-    assert rel_diff < 0.15, (a, e, rel_diff)
+  alpha_expected = d * sqrt_teps_resn * e_per_f
+  assert approx_equal(mch.alpha.data(), alpha_expected, eps=1.e-9)
 
 def exercise_beta_matches_v_formula():
   # .beta = V = TEPS - D^2.
@@ -115,7 +90,7 @@ def exercise_fom_matches_bessel_ratio_reference():
   import scipy.special as sp
   fmodel = build_llgi_fmodel(n_atoms=50, d_min=2.0, seed=15)
   mch = fmodel.map_calculation_helper_llgi()
-  eeff, emodel_abs, d, v, sqrt_teps_resn, inv_sqrt_eps_sigmap = \
+  eeff, emodel_abs, d, v, sqrt_teps_resn, e_per_f = \
     _independent_e_scale_quantities(fmodel)
   centric_flags = fmodel.f_obs().centric_flags().data()
   fom = mch.fom
@@ -131,9 +106,8 @@ def exercise_fom_matches_bessel_ratio_reference():
     else:
       expected = math.tanh(x / 2.0)
     if(not math.isfinite(expected)): continue
-    # 15% relative, as for alpha (from the independent SigmaP)
-    rel_diff = abs(fom[i] - expected) / max(abs(expected), 1.e-6)
-    assert rel_diff < 0.15, (i, fom[i], expected, rel_diff)
+    # scitbx's bessel_i1_over_i0 is an approximation (about 1e-6)
+    assert approx_equal(fom[i], expected, eps=1.e-5), (i, fom[i], expected)
     n_checked += 1
   assert n_checked > 0
 
@@ -328,27 +302,92 @@ def exercise_llgi_fill_is_d_fc():
   assert flex.max(flex.abs(f.data() - d.data()) / flex.abs(d.data())) < 0.01
 
 def exercise_phase_errors_llgi_match_numerical_integration():
-  # Expected |phase error| implied by the LLGI fom, checked against direct
-  # numerical integration of the phase distributions: von Mises
+  # Rice form (no intensities): expected |phase error| of the fom's phase
+  # distribution, checked against direct numerical integration: von Mises
   # exp(X*cos(phi)) (acentric) and the two-point 0/pi distribution with
   # P(pi) = exp(-X)/(1+exp(-X)) (centric).
   import numpy as np
   fmodel = build_llgi_fmodel(n_atoms=50, d_min=2.1, seed=41)
   mch = fmodel.map_calculation_helper_llgi()
+  assert mch.phase_error is None and mch.n_exact == 0
   pher = np.array(fmodel.phase_errors_llgi(mch))
   x = np.array(mch.x)
   centric = np.array(mch.f_obs.centric_flags().data())
-  phi = np.linspace(0.0, np.pi, 20001)
-  worst = 0.0
   for i in np.linspace(0, x.size - 1, 60).astype(int):
     if(centric[i]):
       expected = 180.0 * np.exp(-x[i]) / (1.0 + np.exp(-x[i]))
     else:
-      w = np.exp(x[i] * (np.cos(phi) - 1.0))
-      expected = np.degrees(
-        np.trapezoid(phi * w, phi) / np.trapezoid(w, phi))
-    worst = max(worst, abs(pher[i] - expected))
-  assert worst < 0.05, worst
+      expected = _von_mises_mean_abs_phase(x[i])
+    assert abs(pher[i] - expected) < 1.e-6, (i, x[i], pher[i], expected)
+
+def _von_mises_mean_abs_phase(x):
+  """ <|phi|> in degrees for p(phi) ~ exp(x cos(phi)) on [-pi, pi], by the
+  trapezoid rule on a fine grid over the peak """
+  import numpy as np
+  upper = min(np.pi, 40. / np.sqrt(x)) if x > 0 else np.pi
+  phi = np.linspace(0.0, upper, 200001)
+  w = np.exp(x * (np.cos(phi) - 1.0))
+  return np.degrees(np.trapezoid(phi * w, phi) / np.trapezoid(w, phi))
+
+def exercise_phase_errors_llgi_exact_posterior_mean():
+  # With intensities, the exact posterior: the expected |phase error| is
+  # the mean over the posterior of J = |E|^2 of the phase error given J
+  # (von Mises with x = kappa sqrt(J), or P(pi) = 1/(1 + exp(2 kappa
+  # sqrt(J))) centric), here by the trapezoid rule in s = sqrt(J) and
+  # max_lik's von Mises mean (checked in tst_maxlik); larger than the
+  # phase error implied by the fom (an |E|-weighted mean cosine).
+  import numpy as np
+  import scitbx.math
+  import mmtbx.refinement.llgi_hybrid as llgi_hybrid
+  import mmtbx.refinement.llgi_e_sigmaa as llgi_e_sigmaa
+  from mmtbx import max_lik
+  fmodel = build_llgi_fmodel(n_atoms=50, d_min=2.1, seed=41, rice_kappa=0.0)
+  mch = fmodel.map_calculation_helper_llgi(phase_errors=True)
+  assert mch.n_exact > 0
+  pher = np.array(fmodel.phase_errors_llgi(mch))
+  assert np.all(pher == np.array(mch.phase_error))
+  ld = fmodel.llgi_data()
+  h = llgi_hybrid.get_exact_data(ld)
+  eo, sig = np.array(h.e_obs_sq), np.array(h.sig_e_obs_sq)
+  ec = np.array(flex.abs(
+    llgi_e_sigmaa.build_e_model_as_fitted(fmodel).e_model))
+  sa = np.array(ld.sigmaa.data())
+  centric = np.array(mch.f_obs.centric_flags().data())
+  fom = np.array(mch.fom)
+  exact = np.flatnonzero((sig > 0) & (sa > 0) & (sa < 0.999))
+  assert exact.size == mch.n_exact
+  n_lower = 0
+  for i in exact[np.linspace(0, exact.size - 1, 40).astype(int)]:
+    S = 1. - sa[i] ** 2
+    b = 0.5 if centric[i] else 1.
+    kappa = 2. * b * sa[i] * ec[i] / S
+    j_hi = max(eo[i] + 12. * sig[i], 0.)
+    j_hi = min(j_hi, (sa[i] * ec[i] + 9. * math.sqrt(S)) ** 2) or j_hi
+    s = np.linspace(math.sqrt(max(eo[i] - 12. * sig[i], 0.)),
+      math.sqrt(j_hi), 20001)
+    j = s * s
+    x = kappa * s
+    lw = -(j - eo[i]) ** 2 / (2. * sig[i] ** 2) - b * j / S
+    if(centric[i]):
+      lw += np.logaddexp(x, -x)       # ln cosh, J^(-1/2) dJ = 2 ds
+      pe = 180. / (1. + np.exp(np.minimum(2. * x, 700.)))
+    else:
+      big = x >= 500.
+      ln_i0 = np.where(big, x - 0.5 * np.log(2. * np.pi * np.maximum(x, 1.))
+        + 1. / (8. * np.maximum(x, 1.)), np.log(np.i0(np.minimum(x, 500.))))
+      lw += ln_i0 + np.log(np.maximum(s, 1.e-300))   # dJ = 2 s ds
+      one = flex.double(x.size, 1.)
+      pe = np.array(max_lik.fom_and_phase_error(f_obs=flex.double(x * 0.5),
+        f_model=one, alpha=one, beta=one, epsilons=one,
+        centric_flags=flex.bool(x.size, False)).phase_error())
+    w = np.exp(lw - lw.max())
+    expected = np.trapezoid(w * pe, s) / np.trapezoid(w, s)
+    assert abs(pher[i] - expected) < 1.e-5, (i, pher[i], expected)
+    # the phase error the fom alone would imply
+    if(not centric[i] and fom[i] < 0.999999):
+      x_m = scitbx.math.inverse_bessel_i1_over_i0(flex.double([fom[i]]))
+      if(pher[i] > _von_mises_mean_abs_phase(x_m[0])): n_lower += 1
+  assert n_lower > 0
 
 def exercise_outlier_selection_skips_model_based_test_for_llgi():
   # Model-based outlier rejection (its own Dobs-free sigmaA fit) must not
@@ -392,7 +431,7 @@ def exercise_compute_map_coefficients_mixed_dispatch():
   params = [
     _mcp("2mFo-DFc", fill_missing_f_obs=True),
     _mcp("mFo-DFc", fill_missing_f_obs=False),
-    _mcp("anom", fill_missing_f_obs=False),
+    _mcp("anomalous", fill_missing_f_obs=False),
   ]
   for p in params:
     p.format = ["mtz"]
@@ -425,6 +464,7 @@ def exercise():
   exercise_fill_missing_uses_fitted_sigmaa_curve()
   exercise_llgi_fill_is_d_fc()
   exercise_phase_errors_llgi_match_numerical_integration()
+  exercise_phase_errors_llgi_exact_posterior_mean()
   exercise_outlier_selection_skips_model_based_test_for_llgi()
   exercise_map_coefficients_from_fmodel_ml_target_unaffected()
   exercise_compute_map_coefficients_mixed_dispatch()

@@ -34,11 +34,11 @@ def skip_browser_test():
 
 def skip_QtGUI_test():
   # The Qt GUI tests open the HKLviewer window as WebGL in QWebEngineView needs a display.
-  # On macOS only run them if requested with HKLVIEWER_RUN_GUI_TESTS=1 to avoid windows popping
-  # up when running regression tests on a laptop. On linux only run them on a local machine
-  # with a connected monitor
-  if sys.platform == "darwin" and os.environ.get("HKLVIEWER_RUN_GUI_TESTS", "") != "1":
-    print("Skipping test. Set HKLVIEWER_RUN_GUI_TESTS=1 to run it on macOS")
+  # Set HKLVIEWER_SKIP_GUI_TESTS=1 to skip them, e.g. to avoid windows popping up when running
+  # regression tests on a laptop. On linux only run them on a local machine with a connected
+  # monitor
+  if os.environ.get("HKLVIEWER_SKIP_GUI_TESTS", "") == "1":
+    print("Skipping test as HKLVIEWER_SKIP_GUI_TESTS=1")
     return True
   if 'linux' in sys.platform and os.environ.get("DISPLAY", None) != "0:0":
     return True
@@ -263,11 +263,17 @@ def exercise_OSbrowser(philstr, refl2match, prefix=""):
 
 
 def exerciseQtGUI(philstr, refl2match, prefix=""):
-  # These flags enables QWebEngine, Qt5.15 to work on VMs used on Azure
+  # These flags enables QWebEngine, Qt5.15 to work on VMs used on Azure.
+  # The logging flags put Chromium's GL and renderer messages in the log.
+  # --no-sandbox: on GitHub's Windows Server 2025 runners the sandboxed
+  # renderer process never connects back to the frame.
   os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " --disable-web-security" \
             + " --enable-webgl-software-rendering --disable-gpu-compositing" \
             + " --disable_chromium_framebuffer_multisample --use-gl=swiftshader" \
-            + " --swiftshader --swiftshader-webgl --ignore-gpu-blocklist"
+            + " --swiftshader --swiftshader-webgl --ignore-gpu-blocklist" \
+            + " --enable-logging=stderr --v=1 --no-sandbox"
+  # On Windows Qt warnings go to the debugger, not stderr, without this.
+  os.environ["QT_LOGGING_TO_CONSOLE"] = "1"
   with open(prefix + "environ.txt","w") as mfile:
     # print environment variables to log file
     for k,v in os.environ.items():
