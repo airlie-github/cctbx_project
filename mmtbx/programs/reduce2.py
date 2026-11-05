@@ -161,9 +161,13 @@ capping = False
           with three or more substituents, missing an atom, as an H there \
           would change the chemistry: add the atom (OP3 at a 5-prime end). \
           Done as the very last \
-          step. The caps have names unknown to the restraint libraries, so \
-          the capped model is for QM use and cannot be processed for \
-          restraints. Bond orders come from the CCD Kekule structure \
+          step. A cap whose name is no dictionary atom of its residue \
+          (HCG) has occupancy 0 and is selectable as capping_h. A cap with \
+          a dictionary H name (HB2, HB3 on a truncated CB) takes its \
+          parent's occupancy, as any reduce2 H. pdb_interpretation \
+          recognizes and restrains both, so the capped model can be \
+          processed for restraints. Bond orders come from the \
+          CCD Kekule structure \
           (DOUB and TRIP), all other bonds count as single. Requires \
           qmready=True.
 capping_guess_for_unknowns = False
@@ -1376,8 +1380,7 @@ NOTES:
 
   def _NetRenames(self):
     # Input to output: renames of the input's processing (restraint files)
-    # followed by placement's; a second swap of a pair undoes the first
-    # (flip_symmetric_amino_acids() can do that near chi +-90).
+    # followed by placement's; a second swap of a pair undoes the first.
     net = {}
     for r in self._input_renames + self._placement_renames:
       key = (r.residue, r.altloc)
@@ -1725,7 +1728,9 @@ NOTES:
         lines.append('    (+%d more)' % (len(entries) - len(shown)))
     by_reason = lambda entries, reason: [e for e in entries if e.reason == reason]
     section('Conformer sites written as one isotope',
-      by_reason(r.conformer_sites, 'conformer'), lambda e: e.reason)
+      by_reason(r.conformer_sites, 'conformer'), lambda e: e.reason,
+      remark='These sites have no H/D occupancy pair: a limit of the layout, '
+             'not evidence of full exchange.')
     section('Not split, no free altloc letters',
       by_reason(r.conformer_sites, 'no free altloc letters'), lambda e: e.reason)
     section('Name not pairable by phenix.refine, kept as H',
@@ -1878,6 +1883,10 @@ NOTES:
     # by Hydrogen placement will have flipped them, so we don't need to do it again.
     p.pdb_interpretation.flip_symmetric_amino_acids=False
     #p.pdb_interpretation.sort_atoms=True
+    # unlike placement (get_reduce_pdb_interpretation_params sets False), H
+    # here are final (placement removed its provisional ones): caps in the
+    # model, from the input, are recognized and restrained
+    p.pdb_interpretation.recognize_capping_h = True
     model.set_stop_for_unknowns(self.params.stop_on_any_missing_hydrogen)
     # no ADP pair table, as in place_hydrogens
     model.process(make_restraints=make_restraints, pdb_interpretation_params=p,
@@ -2078,11 +2087,10 @@ NOTES:
     return '\n'.join(lines) + '\n'
 
   def _HNotPlacedText(self, model):
-    # qmready=True: the residues of the finished model that miss H. reduce2
-    # does not place a rotatable H on a shared atom whose bonded partners
-    # carry altlocs (TYR HH on a blank OH with CZ A/B). Residues that miss
-    # non-H atoms (truncated, capping=True) are listed by the atom-complete
-    # check instead.
+    # qmready=True: the residues of the finished model that miss H (an H
+    # that placement dropped: no parameterization, a metal site, a link).
+    # Residues that miss non-H atoms (truncated, capping=True) are listed by
+    # the atom-complete check instead.
     # :param model: The finished model with restraints, not yet capped.
     # :return: The description-file text ('' if none); also in the log.
     heavy = model.missing_atoms_by_residue()
@@ -2091,8 +2099,7 @@ NOTES:
       if k in heavy: continue
       lines.append('  %s: %s' % (k, ' '.join(v)))
     if not lines: return ''
-    lines = ['qmready: H not placed (a rotatable H on a shared atom whose '
-      'partners carry altlocs; place by hand or wait for the reduce2 fix):'
+    lines = ['qmready: H not placed (see the H placement report above):'
       ] + lines
     text = '\n'.join(lines) + '\n'
     print(text, file=self.logger)
@@ -2101,9 +2108,11 @@ NOTES:
   def _CapDanglingAtoms(self, model, r):
     # capping=True: the output model and the Capping report after
     # capping.cap_model() capped model's hierarchy in place, as the last
-    # change to the hierarchy (the caps have names no restraint library
-    # knows). The output model is an unprocessed manager on the capped
-    # hierarchy and nothing interprets it later.
+    # change to the hierarchy (caps not named after a dictionary atom:
+    # occupancy 0, selectable as capping_h; all caps are restrained by
+    # pdb_interpretation when the model is processed). The
+    # output model is an unprocessed manager on the capped hierarchy;
+    # reduce2 does not process it again.
     # :param model: The rebuilt copy with restraints, capped; its X-ray
     # structure and restraints are stale.
     # :param r: The cap_model() result (dangling, capped, warnings).
@@ -2517,8 +2526,8 @@ NOTES:
     if self.params.approach != 'remove':
       # A model passed in memory (e.g. from an earlier run) gives the same
       # result as read from a file. Its cached monomer library server returns
-      # no CCD object for a CCD-only residue it has seen (no setter in
-      # mmtbx.model.manager; get_mon_lib_srv() builds a new one), and its
+      # no CCD object for a CCD-only residue it has seen (get_mon_lib_srv()
+      # then builds a new one), and its
       # riding-H manager, which setup_riding_h_manager() keeps, has the
       # earlier run's X-H lengths; a scattering table set on it (kept by
       # process()) sets the water O-H length when use_neutron_distances is

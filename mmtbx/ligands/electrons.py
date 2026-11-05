@@ -167,7 +167,6 @@ class electron_distribution(dict):
                verbose=False,
                extra_sigma_bonds=None, # {i_seq: n} bonds to atoms not present
                ):
-    alternative_location_id='A'
     self.properties = atom_property()
     self.hierarchy = hierarchy
     self.atoms = self.hierarchy.atoms()
@@ -188,9 +187,21 @@ class electron_distribution(dict):
     else:
       self.logger = log
     self.verbose=verbose
-    if [_f for _f in hierarchy.get_conformer_indices().conformer_indices if _f]:
-      assert (alternative_location_id is not None or
-              alternative_location_index is not None)
+    # A model with alternate conformations is distributed one conformer
+    # (altloc blank + X) at a time: the restraints manager bonds a shared
+    # atom to its neighbour in every conformer (CA to CB A and CB B), and
+    # counted on the whole model those bonds charge the shared atoms.
+    self.conformers = {}
+    altlocs = sorted(a for a in self.hierarchy.altloc_indices().keys()
+                     if a.strip())
+    if alternative_location_id is not None:
+      if alternative_location_id not in altlocs:
+        raise Sorry('electrons: no altloc %s in the model (%s)' % (
+          alternative_location_id, ', '.join(altlocs) or 'no altlocs'))
+      altlocs = [alternative_location_id]
+    if altlocs:
+      self._distribute_conformers(altlocs, extra_sigma_bonds)
+      return
     for atom in self.atoms:
       e = self.properties.get_valence(atom.element)
       assert e is not None, ' element %s not found' % atom.element
@@ -216,6 +227,53 @@ class electron_distribution(dict):
     self.validate_metals()
     self.form_bonds()
     self.adjust_for_multiplicity()
+
+  def _distribute_conformers(self, altlocs, extra_sigma_bonds):
+    # One electron_distribution per conformer on the altloc-free hierarchy
+    # of altloc blank + X with the matching restraints, kept in
+    # self.conformers; the entries, mapped back to the i_seqs of the whole
+    # model, fill self (a shared atom and its bonds from the first conformer
+    # that has them).
+    from scitbx.array_family import flex
+    n = self.atoms.size()
+    if extra_sigma_bonds:
+      for i_seq in extra_sigma_bonds:
+        if not 0 <= i_seq < n:
+          raise Sorry('extra_sigma_bonds: no atom with i_seq %s in the '
+            'electron distribution (%d atoms)' % (i_seq, n))
+    altloc_indices = self.hierarchy.altloc_indices()
+    blank = altloc_indices.get('', flex.size_t())
+    for altloc in altlocs:
+      selection = flex.bool(n, False)
+      selection.set_selected(blank, True)
+      selection.set_selected(altloc_indices[altloc], True)
+      i_seqs = selection.iselection()
+      conformer = self.hierarchy.select(selection, copy_atoms=True)
+      for atom_group in conformer.atom_groups():
+        atom_group.altloc = ''
+      conformer.atoms().reset_i_seq()
+      extra = None
+      if extra_sigma_bonds:
+        extra = {}
+        for j, i_seq in enumerate(i_seqs):
+          if i_seq in extra_sigma_bonds:
+            extra[j] = extra_sigma_bonds[i_seq]
+      distribution = electron_distribution(
+        conformer,
+        self.grm.select(selection),
+        specific_atom_charges        = self.specific_atom_charges,
+        specific_atom_multiplicities = self.specific_atom_multiplicities,
+        log                          = self.logger,
+        verbose                      = self.verbose,
+        extra_sigma_bonds            = extra)
+      self.conformers[altloc] = distribution
+      for key, electrons in distribution.items():
+        if type(key)==type(tuple([])):
+          key = (i_seqs[key[0]], i_seqs[key[1]])
+        else:
+          key = i_seqs[key]
+        if not dict.__contains__(self, key):
+          dict.__setitem__(self, key, electrons)
 
   def __repr__(self):
     return self.show()
@@ -717,6 +775,53 @@ class electron_distribution(dict):
       if self.get_cycle_charge(cycle)==1:
         break
 
+  def _bond_electrons(self, i_seq, j_seq):
+    if (i_seq, j_seq) in self: return self[(i_seq, j_seq)]
+    return self[(j_seq, i_seq)]
+
+  def _ring_nitrogen_takes_double_bond(self, cycle, verbose=False):
+    # A ring left with one unpaired electron (imidazolium, pyridinium): a
+    # ring N with three sigma bonds, frozen above as pyrrole-like with its
+    # lone pair in the ring, takes a double bond instead and is N+. The
+    # path from the unpaired electron to that N along the ring alternates
+    # single, double, ..., single bonds; every bond on it changes order so
+    # that the double bonds move up to the N.
+    neighbours = {}
+    for i_seq, j_seq in cycle:
+      neighbours.setdefault(i_seq, []).append(j_seq)
+      neighbours.setdefault(j_seq, []).append(i_seq)
+    unpaired = [i_seq for i_seq in neighbours if self[i_seq]==1]
+    if len(unpaired)!=1: return False
+    def _find_path(path):
+      i_seq = path[-1]
+      single = len(path)%2==1
+      if single: order = 1
+      else:      order = 2
+      for j_seq in neighbours[i_seq]:
+        if j_seq in path: continue
+        if self._bond_electrons(i_seq, j_seq)!=order: continue
+        if single:
+          if (self.atoms[j_seq].element.strip()=='N' and self[j_seq]==0 and
+              self._is_bond_frozen(i_seq, j_seq) and
+              len(self.get_bonds_containing_i_seq(j_seq))==3):
+            return path+[j_seq]
+          if self[j_seq]!=0: continue
+        rc = _find_path(path+[j_seq])
+        if rc: return rc
+      return None
+    path = _find_path(unpaired)
+    if not path: return False
+    for k in range(len(path)-1):
+      i_seqs = (path[k], path[k+1])
+      if k%2==0:
+        self._add_electron_to_bond(i_seqs)
+      else:
+        self._subtract_electron_from_bond(i_seqs)
+      if verbose: print('ring N+ : %s-%s\n' % (self.atoms[i_seqs[0]].quote(),
+                                               self.atoms[i_seqs[1]].quote(),
+                                              ))
+    return True
+
   def form_bonds_using_networkx(self, verbose=False):
     import networkx as nx
     g = nx.DiGraph()
@@ -870,6 +975,8 @@ class electron_distribution(dict):
         import random
         random.shuffle(cycle)
         # assert 0
+      if cycle_charge_count:
+        self._ring_nitrogen_takes_double_bond(cycle, verbose=verbose)
     if verbose: print('  Double & rings : %0.1fs' % (time.time()-t0))
     #
     # hyper and triple
@@ -1009,7 +1116,30 @@ class electron_distribution(dict):
         print(i_seq, self.atoms[i_seq].quote())
     return rc
 
+  def get_conformer_charges(self):
+    """Total charge of each alternate conformation.
+
+    Returns
+    -------
+    dict
+      {altloc: total charge} of the conformers (altloc blank + altloc) the
+      distribution was built from; empty for a model without altlocs.
+    """
+    rc = {}
+    for altloc, distribution in self.conformers.items():
+      rc[altloc] = distribution.get_total_charge()
+    return rc
+
   def get_total_charge(self):
+    if self.conformers:
+      charges = self.get_conformer_charges()
+      values = sorted(set(charges.values()))
+      if len(values) > 1:
+        raise Sorry('The alternate conformations have different total '
+          'charges (%s). The charge of the model is the charge of one '
+          'conformer; check the protonation of the residues with altlocs.'
+          % ', '.join('%s: %d' % (a, charges[a]) for a in sorted(charges)))
+      return values[0]
     total=0
     for key, electrons in self.items():
       if type(key)==type(tuple([])): continue
@@ -1128,6 +1258,20 @@ output
 }
 '''
 
+def _label_atoms(molecule, atoms, i_seqs=None):
+  '''
+  Stores the quoted model atom on the RDKit atoms: a molecule is one residue, so
+  its atom indices are not those of the model, and caps and added H have no model
+  atom. i_seqs is {molecule index: index in atoms}; by default they are in step.
+  '''
+  for i, atom in enumerate(molecule.GetAtoms()):
+    j = i if i_seqs is None else i_seqs.get(i)
+    if j is not None:
+      atom.SetProp('quote', atoms[j].quote())
+
+def _atom_label(atom):
+  return atom.GetProp('quote' if atom.HasProp('quote') else '_Name')
+
 class Program(ProgramTemplate):
   description = '''
 Count electrons
@@ -1154,7 +1298,10 @@ Inputs:
       verbose = verbose,
       )
     if verbose: print(rc.molecule)
-    if rc.molecule.ok: return rc.molecule.total_charge, rc.molecule.mol
+    if rc.molecule.ok:
+      _label_atoms(rc.molecule.mol, model.get_hierarchy().atoms(),
+                   rc.molecule.rdkit_to_iseq)
+      return rc.molecule.total_charge, rc.molecule.mol
     return None, None
 
   def get_charge_of_molecule_simple(self, molecule, model, iterations=1000, verbose=False):
@@ -1243,7 +1390,6 @@ Inputs:
         raise Sorry('Model must have Hydrogen atoms')
       model.set_log(null_out())
       model.process(make_restraints=True)
-    atoms=model.get_hierarchy().atoms()
 
     t0=time.time()
     if 0:
@@ -1274,6 +1420,7 @@ Inputs:
                                                              verbose=False)
         print(f"Total formal charge simple: {total_charge_each}\n", file=self.logger)
         molecule_each=molecules[i_mol]
+        _label_atoms(molecule_each, models[i_mol].get_hierarchy().atoms())
       else:
         molecules[i_mol]=molecule_each
 
@@ -1312,7 +1459,7 @@ Inputs:
           elif self.params.action.show_non_zero_formal_charges and atom.GetFormalCharge():
             show=True
           if show:
-            outl+=f'  {i+1:2d} {atoms[i].quote()} : charge={atom.GetFormalCharge():2d}\n'
+            outl+=f'  {i+1:2d} {_atom_label(atom)} : charge={atom.GetFormalCharge():2d}\n'
 
       if outl:
         print(f'{header}\n{outl}', file=self.logger)
@@ -1327,7 +1474,7 @@ Inputs:
           break
         for i, atom in enumerate(molecule.GetAtoms()):
           pc=float(atom.GetProp('_GasteigerCharge'))
-          print(f'{i+1:2d} {atoms[i].quote()} : charge={atom.GetFormalCharge():2d} partial={pc:5.2f}')
+          print(f'{i+1:2d} {_atom_label(atom)} : charge={atom.GetFormalCharge():2d} partial={pc:5.2f}')
       if outl:
         print(f'\nPartial charges\n{outl}')
 
@@ -1335,8 +1482,8 @@ Inputs:
       outl=''
       for i_mol, molecule in enumerate(molecules):
         for bond in molecule.GetBonds():
-          q1=atoms[bond.GetBeginAtomIdx()].quote()
-          q2=atoms[bond.GetEndAtomIdx()].quote()
+          q1=_atom_label(bond.GetBeginAtom())
+          q2=_atom_label(bond.GetEndAtom())
           outl+=f'  {q1} - {q2} : {bond.GetBondType()}\n'
       if outl:
         print(f'\nBond types\n{outl}')
@@ -1403,13 +1550,12 @@ def run(pdb_filename=None,
 
 def _run_electrons(model, return_formal_charges, verbose, extra_sigma_bonds):
   atom_valences = electron_distribution(
-    model.get_hierarchy(), # needs to be altloc free
+    model.get_hierarchy(),
     model.get_restraints_manager().geometry,
     verbose=verbose,
     extra_sigma_bonds=extra_sigma_bonds,
   )
   if verbose: print(atom_valences)
-  total_charge = atom_valences.get_total_charge()
   rc = atom_valences.validate_atomic_formal_charges()
   if return_formal_charges: return atom_valences
-  return total_charge
+  return atom_valences.get_total_charge()

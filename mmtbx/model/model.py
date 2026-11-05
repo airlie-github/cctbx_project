@@ -3583,7 +3583,7 @@ class manager(object):
       assert self._xray_structure is not None
       xh_conn_table = self.xh_connectivity_table()
       bfi = self._xray_structure.extract_u_iso_or_u_equiv()
-      for t in self.xh_connectivity_table():
+      for t in xh_conn_table:
         i_x, i_h = t[0], t[1]
         bfi[i_h] = adptbx.u_as_b(bfi[i_x])*scale
       self.set_b_iso(values = bfi, selection = hd_sel, keep_aniso=keep_aniso)
@@ -3597,6 +3597,8 @@ class manager(object):
     alone. Copying the shared parent's occupancy into every copy would make a
     single hydrogen exist at a total occupancy of n_altlocs. Such copies take
     their own conformer's occupancy instead.
+
+    Capping H keep their occupancy (0, so that they add nothing to Fcalc).
     """
     if(self.restraints_manager is None): return
     hd_sel = self.get_hd_selection()
@@ -3612,8 +3614,10 @@ class manager(object):
         if(len(values) > 0):
           conformer_occ[ag.memory_id()] = sum(values)/len(values)
       occ = self.get_occ()
+      caps = self.selection('capping_h')
       for t in self.xh_connectivity_table():
         i_x, i_h = t[0], t[1]
+        if(caps[i_h]): continue
         ag_h = atoms[i_h].parent()
         if(ag_h.altloc.strip()
            and not atoms[i_x].parent().altloc.strip()
@@ -3626,6 +3630,7 @@ class manager(object):
   def reset_occupancies_for_hydrogens(self):
     """
     Set hydrogen occupancies to those of the associated heavy atoms.
+    Capping H keep their occupancy (0, so that they add nothing to Fcalc).
     """
     if(self.restraints_manager is None): return
     occupancy_refinement_selections_1d = flex.size_t()
@@ -3639,10 +3644,12 @@ class manager(object):
       assert self._xray_structure is not None
       xh_conn_table = self.xh_connectivity_table()
       qi = self.get_occ()
+      caps = self.selection('capping_h')
       ct = self.xh_connectivity_table2()
       for t_ in ct.values():
         i_x, i_h = t_[0][0],t_[0][1]
         assert scatterers[i_h].element_symbol() in ["H", "D"]
+        if(caps[i_h]): continue
         if(scatterers[i_x].element_symbol() == "N" and
            i_h in occupancy_refinement_selections_1d):
           occ = flex.double()
@@ -3664,7 +3671,7 @@ class manager(object):
               if(not hd_sel[rf_]):
                 o = qi[rf_]
             for rf_ in rf2:
-              if(o is not None):
+              if(o is not None and not caps[rf_]):
                 qi[rf_] = o
       self.set_occupancies(values = qi, selection = hd_sel)
 
@@ -3963,8 +3970,8 @@ class manager(object):
         print("X-H deviation from ideal after  regularization (bond): mean=%6.3f max=%6.3f"%\
         (flex.mean(xhd), flex.max(xhd)), file=self.log)
 
-  def regularize_geometry(self, force=False, bond_z_max=4.0,
-                          clash_overlap_max=0.4, mean_shift_max=0.3,
+  def regularize_geometry(self, force=False, bond_z_max=6.0,
+                          clash_overlap_max=1.0, mean_shift_max=0.3,
                           max_shift_max=1.0, shell_radius=5.0,
                           max_iterations=500):
     """
@@ -4044,13 +4051,12 @@ class manager(object):
       i_seqs = set()
       for v in violations.bonds + violations.clashes:
         i_seqs.update(v[:2])
-      pairs = crystal.pairs_within(
-        sites_cart       = work.get_sites_cart(),
-        distance_cutoff  = shell_radius,
-        crystal_symmetry = work.crystal_symmetry(),
-        i_seqs           = sorted(i_seqs))
-      for i, j, rt_mx, distance in pairs:
-        i_seqs.add(j)
+      # The pair table (with the symmetry mates) is built in C++;
+      # crystal.pairs_within would compute a distance per pair in Python.
+      pair_table = work.get_xray_structure().pair_asu_table(
+        distance_cutoff=shell_radius).table()
+      for i_seq in sorted(i_seqs):
+        i_seqs.update(pair_table[i_seq].keys())
       atom_selection = flex.bool(n_atoms, False)
       atom_selection.set_selected(flex.size_t(sorted(i_seqs)), True)
       selection = flex.bool(n_atoms, False)

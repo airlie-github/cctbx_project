@@ -2751,8 +2751,46 @@ class _():
             atom.name=' %-3s' % atom.name.strip()
             if verbose: print('corrected PDB format of %s' % atom.quote())
 
-  def flip_symmetric_amino_acids(self):
-    """Swap atom names in symmetric or chiral amino acids"""
+  def flip_symmetric_amino_acids(self, swapped_pairs=None):
+    """
+    Rename symmetric atoms of Arg, Asp, Glu, Phe, Tyr, Val and Leu to the IUPAC
+    convention by exchanging the sites of each pair.
+
+    The test and the pairs are taken per conformer: the blank atoms and all atom
+    groups of one altloc, as in residue_group.conformers(). A conformer flips
+    only if its test says so and its first pair scores better exchanged, so a
+    second call renames nothing. A pair swaps only if both atoms are in the
+    conformer, and a blank atom only if every conformer agrees; otherwise the
+    residue is not flipped and named in the result. So an acid with one H and
+    residues whose conformers disagree stay non-IUPAC. A residue where no
+    conformer has all test atoms is left silently.
+
+    Dihedral conformers whose two namings score within 30 deg of each other, so
+    with a naming that is close to arbitrary, correspond if, for all their
+    common heavy-atom pairs, each atom is nearer one atom of the pair in the
+    other conformer than its partner, by the same names or crossed; this joins
+    them transitively, whatever the current names. If their own decisions would
+    leave names that do not match, they take one of the two namings in which all
+    match, whichever gives the smaller occupancy-weighted score; a tie keeps the
+    naming that renames fewer atoms. The result says so. All other conformers,
+    and Val and Leu always, keep their own decisions.
+
+    All values of a site go with it: xyz, sigxyz, occ, sigocc, b, sigb, uij, fp,
+    fdp, resolution, and siguij where stored. What names the atom stays: name,
+    serial, element, charge, segid, hetero, i_seq, tmp.
+
+    Parameters
+    ----------
+    swapped_pairs : list, optional
+        Receives (atom1, atom2) of every swap, for values kept outside the
+        hierarchy, such as scatterers.
+
+    Returns
+    -------
+    str
+        The residues not flipped with the reason, and the number of residues
+        flipped with the time; empty if there is neither.
+    """
     import time
     from scitbx.math import dihedral_angle
     def chirality_delta(sites, volume_ideal, both_signs):
@@ -2776,11 +2814,17 @@ class _():
              },
       "ASP" : {"dihedral" : ["CA", "CB", "CG", "OD1"],
                "value"    : [0, 1],
-               "pairs"    : [["OD1", "OD2"]],
+               "pairs"    : [["OD1", "OD2"],
+                             ["HD1", "HD2"],
+                            ],
+               "acid_h"   : ["HD1", "DD1"],
              },
       "GLU" : {"dihedral" : ["CB", "CG", "CD", "OE1"],
                "value"    : [0, 1],
-               "pairs"    : [["OE1", "OE2"]],
+               "pairs"    : [["OE1", "OE2"],
+                             ["HE1", "HE2"],
+                            ],
+               "acid_h"   : ["HE1", "DE1"],
              },
       "PHE" : {"dihedral" : ["CA", "CB", "CG", "CD1"],
                "value"    : [0, 1],
@@ -2808,7 +2852,7 @@ class _():
                            ],
                },
     }
-    data["TYR"]=data["PHE"]
+    data["TYR"]=dict(data["PHE"], pairs=list(data["PHE"]["pairs"]))
 
     for code, item in data.items():
       current = item.get('pairs', [])
@@ -2818,62 +2862,271 @@ class _():
           adds.append(['D%s'%a1[1:], 'D%s'%a2[1:]])
       item['pairs']+=adds
 
-    sites_cart = self.atoms().extract_xyz()
+    def find_atom(groups, name):
+      # The atom and whether it is blank. Not atom.parent(): select() shares
+      # atoms, the parent can be gone.
+      for ag in groups:
+        atom = ag.get_atom(name)
+        if atom is not None:
+          return atom, ag.altloc.strip()==""
+      return None, False
+    def conformer_test(flip_data, groups):
+      # (flip?, the sites define no dihedral, score now, score with the first
+      # pair exchanged). flip? None: no decision, an atom of the test is missing
+      # or the sites are coincident or collinear. Flip only if the partner
+      # scores better: else a flip would turn the same test around, and a
+      # twisted ring or a volume near zero would be renamed on every call.
+      assert not ('dihedral' in flip_data and 'chiral' in flip_data)
+      names = flip_data.get("dihedral", flip_data.get("chiral"))
+      def score(names):
+        sites = []
+        for name in names:
+          sites.append(find_atom(groups, name)[0].xyz)
+        if 'dihedral' in flip_data:
+          dihedral = dihedral_angle(sites=sites, deg=True)
+          if dihedral is None: return None
+          return abs(dihedral)
+        return abs(chirality_delta(
+          sites=[flex.vec3_double([xyz]) for xyz in sites],
+          volume_ideal=flip_data["value"][0],
+          both_signs=flip_data['value'][1]))
+      for name in names:
+        if find_atom(groups, name)[0] is None:
+          return None, False, None, None
+      limit = 2.
+      if 'dihedral' in flip_data: limit = 360./flip_data["value"][1]/4
+      score_now = score(names)
+      if score_now is None: return None, True, None, None
+      name1, name2 = flip_data["pairs"][0]
+      if find_atom(groups, name2)[0] is None:
+        return score_now>limit, False, score_now, None
+      exchange = {name1: name2, name2: name1}
+      score_exchanged = score([exchange.get(name, name) for name in names])
+      if score_exchanged is None: return None, True, None, None
+      flip_it = score_now>limit and score_exchanged<score_now
+      return flip_it, False, score_now, score_exchanged
+    def check_conformer(flip_data, groups):
+      flip_it, no_dihedral, score, score_exchanged = conformer_test(
+        flip_data, groups)
+      pairs = []
+      heavy_pairs = []
+      incomplete = other_than_acid_h = has_blank = spans = False
+      for name1, name2 in flip_data["pairs"]:
+        atom1, blank1 = find_atom(groups, name1)
+        atom2, blank2 = find_atom(groups, name2)
+        if atom1 is None and atom2 is None: continue
+        if atom1 is None or atom2 is None:
+          incomplete = True
+          if name1 not in flip_data.get("acid_h", []): other_than_acid_h = True
+          continue
+        pairs.append((atom1, atom2))
+        if name1[0] not in "HD": heavy_pairs.append((atom1, atom2))
+        if blank1 or blank2: has_blank = True
+        if blank1 != blank2: spans = True
+      return group_args(altloc=groups[0].altloc, flip_it=flip_it,
+        is_dihedral='dihedral' in flip_data, no_dihedral=no_dihedral,
+        score=score, score_exchanged=score_exchanged,
+        pairs=pairs, heavy_pairs=heavy_pairs,
+        protonated=incomplete and not other_than_acid_h,
+        incomplete=incomplete, has_blank=has_blank, spans=spans)
+    def naming_is_close(row):
+      # Empirical naming tolerance. Over 333 files, without this limit, the two
+      # namings differ by <= 10.5 deg for near-identical Phe decided together
+      # and by >= 85 deg for the others, different rotamers that are crossed.
+      # Not Val, Leu: the chirality of a conformer is not a joint choice.
+      return (row.is_dihedral
+              and abs(row.score - row.score_exchanged) < 30.)
+    def nearer(atom, target, other):
+      return atom.distance(target) < atom.distance(other)
+    def assignment(row1, row2):
+      # How the heavy pairs of two conformers map, each pair atom nearer one
+      # atom of the other conformer's pair than the other one: False by the
+      # same names, True crossed, None neither. H follow their heavy atoms;
+      # during placement they sit on placeholder sites.
+      pairs2 = dict((pair[0].name, pair) for pair in row2.heavy_pairs)
+      n_pairs = 0
+      direct = crossed = True
+      for atom1, atom2 in row1.heavy_pairs:
+        other = pairs2.get(atom1.name)
+        if other is None: continue
+        n_pairs += 1
+        if not (nearer(atom1, other[0], other[1]) and
+                nearer(atom2, other[1], other[0]) and
+                nearer(other[0], atom1, atom2) and
+                nearer(other[1], atom2, atom1)):
+          direct = False
+        if not (nearer(atom1, other[1], other[0]) and
+                nearer(atom2, other[0], other[1]) and
+                nearer(other[1], atom1, atom2) and
+                nearer(other[0], atom2, atom1)):
+          crossed = False
+      if n_pairs == 0: return None
+      if direct: return False
+      if crossed: return True
+      return None
+    def corresponding_sets(rows):
+      # {index in rows: exchange relative to the first}, joined transitively
+      # with that parity. Depends on the geometry only, not on the current
+      # names: an exchange turns direct into crossed for every link it touches.
+      # A contradiction gives no set.
+      members = [i for i, row in enumerate(rows)
+                 if row.flip_it is not None and not row.incomplete
+                 and naming_is_close(row)]
+      sets = []
+      while members:
+        parity = {members[0]: False}
+        members.remove(members[0])
+        stack = list(parity.keys())
+        contradiction = False
+        while stack:
+          i = stack.pop()
+          for j in range(len(rows)):
+            if j == i or (j not in members and j not in parity): continue
+            crossed = assignment(rows[i], rows[j])
+            if crossed is None: continue
+            expected = parity[i] != crossed
+            if j not in parity:
+              parity[j] = expected
+              members.remove(j)
+              stack.append(j)
+            elif parity[j] != expected:
+              contradiction = True
+        if len(parity) > 1 and not contradiction: sets.append(parity)
+      return sets
+    def decide_together(rows):
+      # Corresponding conformers whose own decisions would leave names that do
+      # not match: one of the two namings in which all match, by the occupancy-
+      # weighted score; a tie keeps the naming that renames fewer atoms. Sets
+      # flip_it; returns [(altlocs, altlocs flipped)].
+      result = []
+      for parity in corresponding_sets(rows):
+        own = set([rows[i].flip_it != parity[i] for i in parity])
+        if len(own) == 1: continue
+        best = None
+        for exchange_first in (False, True):
+          score = 0.
+          n_atoms = 0
+          for i in parity:
+            atom1, atom2 = rows[i].pairs[0]
+            if exchange_first != parity[i]:
+              score += atom2.occ * rows[i].score_exchanged
+              n_atoms += 2 * len(rows[i].pairs)
+            else:
+              score += atom1.occ * rows[i].score
+          if best is None or (score, n_atoms) < best[:2]:
+            best = (score, n_atoms, exchange_first)
+        for i in parity:
+          rows[i].flip_it = best[2] != parity[i]
+        altlocs = sorted([rows[i].altloc for i in parity])
+        flipped = sorted([rows[i].altloc for i in parity if rows[i].flip_it])
+        result.append((altlocs, flipped))
+      return result
+    def incomplete_reason(row):
+      if row.protonated: return "protonated acid (one H on the O pair)"
+      return "not complete"
+    def no_dihedral_reason(row):
+      in_altloc = ""
+      if row.altloc.strip()!="": in_altloc = " in altloc %s" % row.altloc
+      return "test atoms coincident or collinear%s" % in_altloc
+    site_values = ['xyz', 'sigxyz', 'occ', 'sigocc', 'b', 'sigb', 'uij', 'fp',
+                   'fdp', 'resolution']
+    if ext.atom.has_siguij(): site_values.append('siguij')
     t0=time.time()
     info = ""
     flips=0
     for rg in self.residue_groups():
-      flip_it=False
-      for ag in rg.atom_groups():
-        flip_data = data.get(ag.resname, None)
+      atom_groups = rg.atom_groups()
+      resnames = []
+      for ag in atom_groups:
+        if ag.resname not in resnames: resnames.append(ag.resname)
+      for resname in resnames: # microheterogeneity: separate residues
+        flip_data = data.get(resname, None)
         if flip_data is None: continue
-        assert not ('dihedral' in flip_data and 'chiral' in flip_data)
-        if not flip_it:
-          if 'dihedral' in flip_data:
-            sites = []
-            for d in flip_data["dihedral"]:
-              atom = ag.get_atom(d)
-              if atom is None: break
-              sites.append(atom.xyz)
-            if len(sites)!=4: continue
-            dihedral = dihedral_angle(sites=sites, deg=True)
-            if abs(dihedral)>360./flip_data["value"][1]/4:
-              flip_it=True
-          elif 'chiral' in flip_data:
-            sites = []
-            for d in flip_data["chiral"]:
-              atom = ag.get_atom(d)
-              if atom is None: break
-              sites.append(atom.xyz)
-            if len(sites)!=4: continue
-            delta = chirality_delta(sites=[flex.vec3_double([xyz]) for xyz in sites],
-                                    volume_ideal=flip_data["value"][0],
-                                    both_signs=flip_data['value'][1],
-                                    )
-            if abs(delta)>2.:
-              flip_it=True
-        if flip_it:
-          flips_stored = []
-          atoms = ag.atoms()
-          for pair in flip_data["pairs"]:
-            atom1 = ag.get_atom(pair[0])
-            atom2 = ag.get_atom(pair[1])
-            if atom1 is None and atom2 is None: continue
-            if len(list(filter(None, [atom1, atom2]))) == 1:
-              flips_stored=[]
-              info += '    Residue "%s %s %s": not complete - not flipped' % (
-                rg.parent().id,
-                ag.resname,
-                rg.resseq,
-              )
-              break
-            flips_stored.append([atom1,atom2])
-          for atom1, atom2 in flips_stored:
-            for attr in ['xyz', 'b']:
+        blank = []
+        altlocs = collections.OrderedDict()
+        for ag in atom_groups:
+          if ag.resname != resname: continue
+          if ag.altloc.strip()=="": blank.append(ag)
+          else: altlocs.setdefault(ag.altloc, []).append(ag)
+        conformers = [groups+blank for groups in altlocs.values()]
+        if not conformers: conformers = [blank]
+        rows = [check_conformer(flip_data, groups) for groups in conformers]
+        together = []
+        if True not in [row.has_blank for row in rows]:
+          together = decide_together(rows)
+        decisions = [row.flip_it for row in rows]
+        no_dihedral = [row for row in rows if row.no_dihedral]
+        if True not in decisions and not no_dihedral and not together: continue
+        reasons = []
+        to_swap = []
+        if True in [row.has_blank for row in rows]:
+          # a blank atom belongs to every conformer: all flip or none
+          if True in [row.spans for row in rows]:
+            reasons.append("pair spans blank and altloc")
+          elif True in [row.flip_it and row.incomplete for row in rows]:
+            incomplete = [row for row in rows if row.flip_it and row.incomplete]
+            reasons.append(incomplete_reason(incomplete[0]))
+          elif no_dihedral:
+            reasons.append(no_dihedral_reason(no_dihedral[0]))
+          elif None in decisions:
+            untested = rows[decisions.index(None)]
+            reasons.append("test atom missing in altloc %s" % untested.altloc)
+          elif False in decisions:
+            reasons.append("conformers disagree")
+          else:
+            to_swap = rows
+        else:
+          for row in rows:
+            in_altloc = ""
+            if row.altloc.strip()!="": in_altloc = " in altloc %s" % row.altloc
+            if row.no_dihedral:
+              reasons.append(no_dihedral_reason(row))
+            elif row.flip_it is None:
+              if row.pairs:
+                reasons.append("test atom missing%s" % in_altloc)
+            elif row.flip_it:
+              if row.incomplete:
+                reasons.append("%s%s" % (incomplete_reason(row), in_altloc))
+              else:
+                to_swap.append(row)
+        model_id = ""
+        if self.models_size() > 1:
+          model_id = "MODEL %s " % rg.parent().parent().id.strip()
+        for reason in reasons:
+          info += '    Residue "%s%s %s %s%s": %s - not flipped\n' % (
+            model_id,
+            rg.parent().id,
+            resname,
+            rg.resseq,
+            rg.icode.strip(),
+            reason,
+          )
+        for altlocs, flipped in together:
+          if not flipped: outcome = "not flipped"
+          elif flipped == altlocs: outcome = "flipped"
+          else: outcome = "flipped in altlocs %s" % ", ".join(flipped)
+          info += '    Residue "%s%s %s %s%s": altlocs %s correspond, decided ' \
+            'together - %s\n' % (
+            model_id,
+            rg.parent().id,
+            resname,
+            rg.resseq,
+            rg.icode.strip(),
+            ", ".join(altlocs),
+            outcome,
+          )
+        done = []
+        for row in to_swap:
+          for atom1, atom2 in row.pairs:
+            if atom1.memory_id() in done: continue # blank: in each conformer
+            done.append(atom1.memory_id())
+            for attr in site_values:
               tmp = getattr(atom1, attr)
               setattr(atom1, attr, getattr(atom2, attr))
               setattr(atom2, attr, tmp)
-          flips+=1
+            if swapped_pairs is not None:
+              swapped_pairs.append((atom1, atom2))
+        if done: flips+=1
     if flips or info:
       info += '  Time to flip %d residue(s): %0.2fs\n' % (flips, time.time()-t0)
     return info

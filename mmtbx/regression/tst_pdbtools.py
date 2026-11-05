@@ -9,8 +9,11 @@ from libtbx.test_utils import approx_equal, not_approx_equal, run_command, \
 import iotbx.pdb
 from scitbx.array_family import flex
 from cctbx import adptbx
+import iotbx.phil
 import mmtbx.model
+import mmtbx.pdbtools
 from six.moves import cStringIO as StringIO, zip
+from iotbx.pdb.tst_hierarchy_flip_symmetric import pdb_1us0_phe_276
 from libtbx import easy_run
 
 full_params = mmtbx.model.manager.get_default_pdb_interpretation_params()
@@ -1300,6 +1303,138 @@ END
   ph_in.flip_symmetric_amino_acids()
   assert h1.is_similar_hierarchy(ph_in)
 
+flip_site_values_str = """\
+CRYST1   60.000   60.000   60.000  90.00  90.00  90.00 P 1
+ATOM      1  N   GLU B   1      10.832  16.231  17.917  1.00 56.97           N
+ATOM      2  CA  GLU B   1      10.794  15.198  18.995  1.00 52.47           C
+ATOM      3  C   GLU B   1      10.700  13.803  18.381  1.00 46.38           C
+ATOM      4  O   GLU B   1      11.454  13.456  17.470  1.00 44.22           O
+ATOM      5  CB  GLU B   1      12.033  15.306  19.893  1.00 63.38           C
+ATOM      6  CG  GLU B   1      11.783  14.967  21.365  1.00 61.17           C
+ATOM      7  CD  GLU B   1      11.547  13.486  21.609  1.00 56.72           C
+ATOM      8  OE1 GLU B   1      11.005  13.137  22.680  0.70 64.27           O
+ANISOU    8  OE1 GLU B   1     8000   8100   8200    100    200    300       O
+ATOM      9  OE2 GLU B   1      11.904  12.668  20.735  0.30 57.61           O
+%s"""
+flip_site_values_aniso = \
+"ANISOU    9  OE2 GLU B   1     7000   7100   7200   -100   -200   -300       O\n"
+
+def flip_site_values_run(pdb_str, flip, edits):
+  # the modified model; hierarchy atoms and scatterers correspond
+  params = mmtbx.pdbtools.master_params().fetch(iotbx.phil.parse(
+    "modify {\nflip_symmetric_amino_acids=%s\n%s\n}" % (flip, edits))
+    ).extract().modify
+  model = mmtbx.model.manager(
+    model_input=iotbx.pdb.input(source_info=None, lines=pdb_str))
+  return mmtbx.pdbtools.modify(model=model, params=params,
+    log=StringIO()).get_results().model
+
+def flip_site_values(model, i):
+  sc = model.get_xray_structure().scatterers()[i]
+  atom = model.get_hierarchy().atoms()[i]
+  return [sc.site, sc.occupancy, sc.u_iso, sc.u_star, sc.flags.use_u_iso(),
+    sc.flags.use_u_aniso(), sc.fp, sc.fdp, atom.xyz, atom.occ, atom.b, atom.uij]
+
+def exercise_flip_site_values():
+  # Every scatterer as in the same run without the flip, except that the
+  # renamed pair has exchanged its values: the flip comes after all edits, so a
+  # selection means the same atoms with or without it. Scatterers carry edits
+  # the hierarchy does not have when the flip happens.
+  i1, i2 = 7, 8
+  cases = ["",
+    "adp.set_b_iso=80",
+    "adp {\nset_b_iso=80\natom_selection=name OE1\n}",
+    "adp.convert_to_isotropic=True",
+    "adp.convert_to_anisotropic=True",
+    "occupancies.set=0.4",
+    "occupancies {\nset=0.4\natom_selection=name OE1\n}",
+    "sites {\natom_selection=name OE1\ntranslate=0.1 0 0\n}",
+    "rotate_about_axis {\naxis=0 0 0 0 0 1\natom_selection=all\nangle=30\n}"]
+  for aniso in (flip_site_values_aniso, ""):
+    pdb_str = flip_site_values_str % aniso
+    for edits in cases:
+      plain = flip_site_values_run(pdb_str, False, edits)
+      flipped = flip_site_values_run(pdb_str, True, edits)
+      assert plain.size() == flipped.size() == 9
+      for i in range(9):
+        partner = {i1: i2, i2: i1}.get(i, i)
+        assert approx_equal(flip_site_values(flipped, i),
+                            flip_site_values(plain, partner), eps=1.e-9,
+                            multiplier=None), (edits, i)
+      # names, and what goes with them, stay
+      for model in (plain, flipped):
+        scatterers = model.get_xray_structure().scatterers()
+        assert model.get_hierarchy().atoms()[i1].name == " OE1"
+        assert "OE1" in scatterers[i1].label
+      assert plain.get_hierarchy().atoms()[i1].xyz != \
+        flipped.get_hierarchy().atoms()[i1].xyz, edits
+  # every selection sees the input names: adp and occupancies on one site, which
+  # the flip renames from OE1 to OE2
+  pdb_str = flip_site_values_str % flip_site_values_aniso
+  model = flip_site_values_run(pdb_str, True,
+    "adp {\nset_b_iso=80\natom_selection=name OE1\n}\n"
+    "occupancies {\nset=0.4\natom_selection=name OE1\n}")
+  atoms = model.get_hierarchy().atoms()
+  scatterers = model.get_xray_structure().scatterers()
+  assert atoms[i2].name == " OE2"
+  assert approx_equal(atoms[i2].xyz, (11.005, 13.137, 22.680), eps=1.e-3)
+  assert approx_equal(atoms[i2].occ, 0.4)
+  assert approx_equal(atoms[i2].b, 80, eps=1.e-3)
+  assert approx_equal(atoms[i1].occ, 0.3)
+  assert not approx_equal(atoms[i1].b, 80, eps=1.e-3, out=None)
+  assert approx_equal(scatterers[i2].occupancy, 0.4)
+  assert approx_equal(scatterers[i1].occupancy, 0.3)
+  # the flip decides on the rotated sites: OE1, OE2 turned 180 deg about CG-CD
+  # bring OE1 within 90 deg, so nothing flips; without them it flips
+  rotate = ("rotate_about_axis {\naxis=name CG or name CD\n"
+    "atom_selection=name OE1 or name OE2\nangle=180\n}")
+  plain = flip_site_values_run(pdb_str, False, rotate)
+  flipped = flip_site_values_run(pdb_str, True, rotate)
+  assert approx_equal(flipped.get_hierarchy().atoms().extract_xyz(),
+    plain.get_hierarchy().atoms().extract_xyz(), eps=1.e-6)
+
+def exercise_flip_uses_edited_occupancies():
+  # 1us0 Phe A 276: 0.62, 0.38 in the file flip A and B; the edited 0.38, 0.62
+  # keep both, as in a file with these occupancies
+  occ = {"A": "0.38", "B": "0.62"}
+  edited = "\n".join(
+    l[:54] + "  " + occ[l[16]] + l[60:] for l in pdb_1us0_phe_276.splitlines())
+  hierarchy = iotbx.pdb.input(source_info=None, lines=edited).construct_hierarchy()
+  pairs = []
+  hierarchy.flip_symmetric_amino_acids(swapped_pairs=pairs)
+  assert pairs == []
+  edits = ("occupancies {\nset=0.38\natom_selection=altloc A\n}\n"
+           "occupancies {\nset=0.62\natom_selection=altloc B\n}")
+  pdb_str = "CRYST1   60.000   60.000   60.000  90.00  90.00  90.00 P 1\n" + \
+    pdb_1us0_phe_276
+  plain = flip_site_values_run(pdb_str, False, edits)
+  flipped = flip_site_values_run(pdb_str, True, edits)
+  assert approx_equal(flipped.get_hierarchy().atoms().extract_xyz(),
+    plain.get_hierarchy().atoms().extract_xyz(), eps=1.e-6)
+  assert approx_equal(flipped.get_hierarchy().atoms().extract_occ(),
+    plain.get_hierarchy().atoms().extract_occ(), eps=1.e-6)
+  # the file's own occupancies flip both
+  flipped = flip_site_values_run(pdb_str, True, "")
+  assert not approx_equal(flipped.get_hierarchy().atoms().extract_xyz(),
+    plain.get_hierarchy().atoms().extract_xyz(), eps=1.e-6, out=None)
+
+def exercise_flip_site_values_command_line(
+      prefix="exercise_flip_site_values_command_line"):
+  with open("%s.pdb" % prefix, "w") as f:
+    f.write(flip_site_values_str % flip_site_values_aniso)
+  run_command(command=" ".join(["phenix.pdbtools", "%s.pdb" % prefix,
+    "flip_symmetric_amino_acids=True", "output.prefix=%s" % prefix]),
+    verbose=False)
+  atoms = iotbx.pdb.input(
+    file_name="%s_modified.pdb" % prefix).construct_hierarchy().atoms()
+  oe1, oe2 = atoms[7], atoms[8]
+  assert oe1.name == " OE1" and oe2.name == " OE2"
+  assert approx_equal(oe1.xyz, (11.904, 12.668, 20.735), eps=1.e-3)
+  assert approx_equal(oe1.occ, 0.3)
+  assert approx_equal(oe2.occ, 0.7)
+  assert approx_equal(oe1.uij[:3], (0.7, 0.71, 0.72), eps=1.e-3)
+  assert approx_equal(oe2.uij[:3], (0.8, 0.81, 0.82), eps=1.e-3)
+
 def exercise_result_is_empty(prefix='exercise_result_is_empty'):
   pdb_str = """
 HELIX    1   1 GLN A   10  GLN A   14  5                                   5
@@ -1409,6 +1544,9 @@ END
 def exercise(args):
   exercise_average_alt_confs()
   exercise_flip_symmetric_amino_acids()
+  exercise_flip_site_values()
+  exercise_flip_uses_edited_occupancies()
+  exercise_flip_site_values_command_line()
   exercise_switch_rotamers()
   exercise_mmcif_support_2()
   exercise_basic()
