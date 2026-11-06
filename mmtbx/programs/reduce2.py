@@ -37,7 +37,7 @@ import copy
 from iotbx.data_manager import DataManager
 import csv
 
-version = "3.6.0"
+version = "3.8.0"
 
 master_phil_str = '''
 approach = *add remove optimize place
@@ -178,15 +178,41 @@ capping_guess_for_unknowns = False
           the valence of every atom from its element and formal charge, bonds \
           from distances, and add H accordingly (reported as guessed). \
           False: stop with a Sorry listing those residues.
-include_symmetric_copies = False
+include_symmetric_copies = True
   .type = bool
   .short_caption = Score Movers against symmetry mates
-  .help = Copies of the symmetry mates within 3.6 A of the model, from the \
-          input's own crystal symmetry (none for a placeholder cell such as \
-          CRYST1 1 1 1, or without symmetry), are a fixed environment for the \
-          optimization: scored, not moved, and refreshed until they agree \
-          with their originals. The flipkin and comparison passes run without \
-          copies.
+  .help = On by default. Copies of the symmetry mates within 3.6 A of the \
+          model, from the input's own crystal symmetry (none for a placeholder \
+          cell such as CRYST1 1 1 1, or without symmetry), are a fixed \
+          environment for the optimization: scored, not moved, and refreshed \
+          until they agree with their originals, so H-bonds, clashes and \
+          metals across crystal contacts count. The flipkin and comparison \
+          passes still run without copies, so at crystal contacts they can \
+          differ from the main result.
+protonation
+  .multiple = True
+  .optional = True
+  .short_caption = Protonation state of selected residues
+  .help = Sets the protonation state of the selected residues (whole \
+          residues, all conformers), with approach=add or place. The state \
+          wins over the automatic rules (thiolates, metal-bound N-H, the His \
+          ion lock, also for metals in symmetry mates), and conflicts are \
+          listed. A His with a state gets no flip Mover, also in the flipkin \
+          passes. Repeat the scope for more residues, best in an .eff file: \
+          on the command line each word of a repeated scope starts a new \
+          entry. See NOTES in the program description.
+{
+  selection = None
+    .type = str
+    .short_caption = Residues
+    .help = Atom selection, expanded to whole residues
+  state = his_hd1 his_he2 his_both protonated deprotonated
+    .type = choice
+    .short_caption = Protonation state
+    .help = his_hd1, his_he2: HIS with HD1 only or HE2 only. his_both: HIS \
+            with both. protonated: ASP with HD2 on OD2, GLU with HE2 on OE2. \
+            deprotonated: CYS without HG, TYR without HH.
+}
 output
   .style = menu_item auto_align
 {
@@ -987,6 +1013,24 @@ def _SelectModelNumber(hierarchy, number):
 
 # ------------------------------------------------------------------------------
 
+def _NamesByConformer(atom_groups, keep=None):
+  # {altloc: atom names} of one residue's atom groups, blank atoms in every
+  # conformer ('' alone without altlocs); keep(atom) selects
+  alts = sorted(set(ag.altloc for ag in atom_groups) - {''}) or ['']
+  result = {}
+  for alt in alts:
+    names = set()
+    for ag in atom_groups:
+      if ag.altloc not in ('', alt): continue
+      for a in ag.atoms():
+        if keep is None or keep(a): names.add(a.name.strip())
+    result[alt] = names
+  return result
+
+# the acid H torsion of a protonated ASP/GLU (A46 report)
+_ACID_H_DIHEDRAL = {'ASP': ('CB', 'CG', 'OD2', 'HD2'),
+                    'GLU': ('CG', 'CD', 'OE2', 'HE2')}
+
 class Program(ProgramTemplate):
   description = '''
 reduce2 version {}
@@ -1039,6 +1083,33 @@ NOTES:
   converted) and lists them. With approach=add or place and keep_existing_H=True, their
   existing H/D are kept unchanged and they are listed. With keep_existing_H=False such a
   residue gets no H. Cannot be combined with approach=remove or qmready=True.
+
+  protonation sets the protonation state of whole residues (all conformers):
+    his_hd1       HIS with HD1 only (no HE2)
+    his_he2       HIS with HE2 only (no HD1)
+    his_both      HIS with HD1 and HE2
+    protonated    ASP with HD2 on OD2, GLU with HE2 on OE2 (the O as named in the input)
+    deprotonated  CYS without HG, TYR without HH
+  Give the entries in an .eff file, one scope per entry:
+    protonation {{
+      selection = "chain A and resseq 56"
+      state = his_he2
+    }}
+    protonation {{
+      selection = "chain A and (resseq 99 or resseq 143)"
+      state = protonated
+    }}
+  On the command line each word of a repeated scope starts a new entry, so
+  protonation.selection=... protonation.state=... gives two half entries (a Sorry).
+  The state wins over the automatic rules (thiolates, H on metal-bound N, the His ion
+  lock, also for metals in symmetry mates), and the conflicts are listed in the log and
+  the description file, with one line per residue saying which H were added, kept or
+  left out. A His with a state gets no flip Mover and no ion lock, in the main run and
+  in the flipkin passes. A protonated ASP/GLU H rotates; if it ends more than 30 deg
+  from syn or anti, its line gives the angle. Only with approach=add or place: to keep
+  the input H and set a state, use approach=add keep_existing_H=True (supplied H that
+  contradict the state stop with a Sorry, missing ones are added). Symmetry copies are
+  made from the model with its states.
 
   qmready=True prepares a model for QM: H on water, longer XH distances, OXT and NH3+ at
   chain ends and breaks, HO3' and HO5' at nucleic-acid chain ends, and the geometry of the
@@ -1196,6 +1267,7 @@ NOTES:
         mon_lib_srv           = self.model.get_mon_lib_srv(),
         na_terminal_h         = True,
         metal_bound_amines_as_nh2 = self.params.metal_bound_amines_as_nh2,
+        protonation_states    = self._protonation.states,
       )
     else:
       reduce_add_h_obj = reduce_hydrogen.place_hydrogens(
@@ -1206,13 +1278,15 @@ NOTES:
         stop_for_unknowns=self.params.stop_on_any_missing_hydrogen,
         keep_existing_H=self.params.keep_existing_H,
         mon_lib_srv=self.model.get_mon_lib_srv(),
-        metal_bound_amines_as_nh2=self.params.metal_bound_amines_as_nh2
+        metal_bound_amines_as_nh2=self.params.metal_bound_amines_as_nh2,
+        protonation_states=self._protonation.states
       )
     reduce_add_h_obj.supplied_h_hint = self._RebuildHint()
     # the model is boxed for the calculation: contacts across its own symmetry
     reduce_add_h_obj.input_crystal_symmetry = self._output_cs
     reduce_add_h_obj.run()
     reduce_add_h_obj.show(self.logger, verbose=self.params.verbosity > 2)
+    self._protonation.conflicts = reduce_add_h_obj.protonation_conflicts
     # its report of atom names not in the dictionary, for the description
     self._unknown_atoms_note = ''
     if reduce_add_h_obj.residues_unknown_atoms:
@@ -1269,6 +1343,176 @@ NOTES:
     # for example when running on 8zst.cif.
     if not hasattr(self.model, '_type_energies'):
       self._ReinterpretModel(make_restraints=True)
+
+# ------------------------------------------------------------------------------
+
+  def _ProtonationStates(self):
+    # The protonation entries, checked against the input model: each a Sorry
+    # naming the entry (empty selection, a state that does not fit a selected
+    # residue, a residue in two entries, approach other than add or place,
+    # supplied H contradicting the state when they are kept).
+    # :return: group_args(states {protonation_key(): state}, residues
+    # [(key, label, state, resnames, altlocs, supplied H/D names per conformer)],
+    # conflicts).
+    result = group_args(states = {}, residues = [], conflicts = [])
+    entries = [e for e in (self.params.protonation or [])
+               if not (e.selection is None and e.state is None)]
+    if not entries: return result
+    p = self.params
+    def name(k, e):
+      return 'protonation entry %d (selection=%s, state=%s)' % (k + 1,
+        e.selection, e.state)
+    for k, e in enumerate(entries):
+      if e.selection is None or e.state is None:
+        raise Sorry('%s: both selection and state are needed.' % name(k, e))
+    if p.approach not in ('add', 'place'):
+      hint = ''
+      if p.approach == 'optimize':
+        hint = (' To keep the input H and set the state, use approach=add '
+          'keep_existing_H=True.')
+      raise Sorry('protonation entries need approach=add or place '
+        '(approach=%s): %s.%s' % (p.approach, name(0, entries[0]), hint))
+    model = self.data_manager.get_model()
+    hierarchy = model.get_hierarchy()
+    n_models = len(hierarchy.models())
+    keep_input_h = p.keep_existing_H or p.qmready
+    owner = {}
+    for k, e in enumerate(entries):
+      try:
+        sel = model.selection(e.selection)
+      except Exception as x:
+        raise Sorry('%s: the selection is not valid (%s).' % (name(k, e),
+          str(x).strip()))
+      if sel.count(True) == 0:
+        raise Sorry('%s: the selection matches no atoms.' % name(k, e))
+      rule = reduce_hydrogen.PROTONATION_STATES[e.state]
+      # residue groups by key: a residue split in the file is one residue
+      groups = {}
+      for a in hierarchy.atoms().select(sel):
+        groups[reduce_hydrogen.protonation_key(a.parent().parent())] = []
+      for rg in hierarchy.residue_groups():
+        key = reduce_hydrogen.protonation_key(rg)
+        if key in groups: groups[key].append(rg)
+      for key, rg_list in groups.items():
+        ags = [ag for rg in rg_list for ag in rg.atom_groups()]
+        resnames = sorted(set(ag.resname.strip() for ag in ags))
+        rg = rg_list[0]
+        label = '%s %s %s%s' % ('/'.join(resnames), rg.parent().id.strip(),
+          rg.resseq.strip(), rg.icode.strip())
+        if n_models > 1: label += ' (model %s)' % key[0]
+        bad = [r for r in resnames if r not in rule]
+        if bad:
+          raise Sorry('%s: state %s does not fit %s (it is for %s).' % (
+            name(k, e), e.state, label, ', '.join(sorted(rule))))
+        if key in owner:
+          raise Sorry('%s: %s is also in protonation entry %d.' % (name(k, e),
+            label, owner[key] + 1))
+        owner[key] = k
+        supplied = sorted(set(at.name.strip() for ag in ags for at in ag.atoms()
+          if at.element.strip().upper() in ('H', 'D')))
+        supplied_by_conformer = _NamesByConformer(ags,
+          lambda at: at.element.strip().upper() in ('H', 'D'))
+        if keep_input_h:
+          wrong = [n for r in resnames for n in supplied
+                   if n in reduce_hydrogen._with_d_names(rule[r][1] +
+                     rule[r][2])]
+          if wrong:
+            raise Sorry('%s: %s has supplied %s, which contradict%s state %s '
+              '(the supplied H are kept: %s). Remove %s or change the state.'
+              % (name(k, e), label, ', '.join(wrong),
+              's' if len(wrong) == 1 else '', e.state,
+              'qmready=True' if p.qmready else 'keep_existing_H=True',
+              'it' if len(wrong) == 1 else 'them'))
+        altlocs = sorted(set(ag.altloc for ag in ags) - {''})
+        result.states[key] = e.state
+        result.residues.append((key, label, e.state, resnames, altlocs,
+          supplied_by_conformer))
+    return result
+
+# ------------------------------------------------------------------------------
+
+  def _FixedHisKeys(self):
+    # the His whose state the user set, for the Optimizer (no Mover, no lock)
+    return [k for k, s in self._protonation.states.items()
+            if s.startswith('his_')]
+
+  def _AcidOutOfPlaneText(self, key, resname):
+    # A46: the acid H can end out of the carboxyl plane. Report only, beyond
+    # 30 deg from syn or anti, per conformer.
+    from scitbx.matrix import dihedral_angle
+    names = _ACID_H_DIHEDRAL[resname]
+    words = []
+    for rg in self.model.get_hierarchy().residue_groups():
+      if reduce_hydrogen.protonation_key(rg) != key: continue
+      for c in rg.conformers():
+        xyz = dict((a.name.strip(), a.xyz) for a in c.atoms())
+        if not all(n in xyz for n in names): continue
+        d = dihedral_angle(sites=[xyz[n] for n in names], deg=True)
+        if d is None: continue
+        off = min(abs(d), 180 - abs(d))
+        if off <= 30: continue
+        where = ''
+        if c.altloc: where = ' in %s' % c.altloc
+        words.append('%s %d deg out of the carboxyl plane%s' % (names[3],
+          round(off), where))
+    if not words: return ''
+    return ', '.join(words)
+
+  def _ProtonationText(self, optimized=False):
+    # One line per residue with a protonation state (its H in the model) and
+    # the conflicts with the automatic rules. Printed here. optimized: after
+    # the Optimizer, the acid H out of the carboxyl plane are added.
+    # :return: The description-file text ('' without entries).
+    pr = self._protonation
+    if not pr.residues: return ''
+    keep_input_h = self.params.keep_existing_H or self.params.qmready
+    ags = {}
+    for rg in self.model.get_hierarchy().residue_groups():
+      key = reduce_hydrogen.protonation_key(rg)
+      if key in pr.states: ags.setdefault(key, []).extend(rg.atom_groups())
+    present = dict((key, _NamesByConformer(a)) for key, a in ags.items())
+    lines = ['Protonation states set by the user (protonation):']
+    for key, label, state, resnames, altlocs, supplied in pr.residues:
+      parts = []
+      for r in resnames:
+        carried, left_out = reduce_hydrogen.PROTONATION_STATES[state][r][:2]
+        for h in carried:
+          # one phrase per conformer, one if all agree. Input D were
+          # normalized to H: the supplied names tell. A conformer not in the
+          # input (an H/D pair merged into one site, or a blank residue
+          # given altlocs) takes the H of every input conformer.
+          status = []
+          for alt, names in sorted(present.get(key, {}).items()):
+            given = set()
+            if keep_input_h and alt in supplied: given = supplied[alt]
+            elif keep_input_h:
+              for n in supplied.values(): given |= n
+            kept = [n for n in (h, 'D' + h[1:]) if n in given]
+            if kept: phrase = '%s kept (supplied)' % '/'.join(kept)
+            elif h in names: phrase = '%s added' % h
+            else: phrase = '%s not placed' % h
+            status.append((alt, phrase))
+          phrases = set(p for alt, p in status)
+          if len(phrases) <= 1:
+            parts.append(phrases.pop() if phrases else '%s not placed' % h)
+          else:
+            parts.append('; '.join('%s in %s' % (p, alt) for alt, p in status))
+        if optimized and state == 'protonated' and r in _ACID_H_DIHEDRAL:
+          off = self._AcidOutOfPlaneText(key, r)
+          if off: parts.append(off)
+        for h in left_out:
+          parts.append('%s left out' % h)
+      what = reduce_hydrogen.protonation_state_text(state, resnames[0])
+      conformers = ''
+      if altlocs: conformers = ', conformers %s' % ' '.join(altlocs)
+      lines.append('  %s: %s (%s%s): %s' % (label, what, state, conformers,
+        ', '.join(parts) or 'no H changed'))
+    if pr.conflicts:
+      lines.append('Conflicts with the automatic rules (the state is kept):')
+      lines.extend('  ' + c for c in pr.conflicts)
+    text = '\n' + '\n'.join(lines) + '\n'
+    print(text, file=self.logger)
+    return text
 
 # ------------------------------------------------------------------------------
 
@@ -2322,6 +2566,9 @@ NOTES:
         raise Sorry('%s requires optimization; it cannot be used with '
           'approach=place.' % ', '.join(bad))
 
+    # protonation entries: residues and states, checked against the input
+    self._protonation = self._ProtonationStates()
+
     # Set the default output file name if one has not been given.
     # With qmready=True the total charge is appended to the default name later.
     self._default_output_filename = self.params.output.filename is None
@@ -2389,6 +2636,9 @@ NOTES:
 
     # Set our bonded-neighbor depth
     self._bondedNeighborDepth = self.params.bonded_neighbor_depth
+    # protonation entries (validate() checks them)
+    if getattr(self, '_protonation', None) is None:
+      self._protonation = self._ProtonationStates()
 
     # Input H/D check (neutron_option): records of collapsed pairs, notes and
     # floating H/D dropped there
@@ -2486,9 +2736,14 @@ NOTES:
     self._placement_renames = []
     if self.data_manager.has_restraints():
       self.model.set_stop_for_unknowns(self.params.stop_on_any_missing_hydrogen)
-      # default interpretation parameters: renames symmetric side-chain atoms
+      # default interpretation parameters without the IUPAC flip (B23): a
+      # restraint file must not decide the names. optimize and remove keep the
+      # input names; add and place rename once, in placement.
+      no_flip = mmtbx.model.manager.get_default_pdb_interpretation_params()
+      no_flip.pdb_interpretation.flip_symmetric_amino_acids = False
       sites_before = reduce_hydrogen.atom_group_sites(self.model.get_hierarchy())
-      self.model.process(make_restraints=False)
+      self.model.process(make_restraints=False,
+        pdb_interpretation_params=no_flip)
       self._input_renames = reduce_hydrogen.symmetric_renames(sites_before,
         self.model.get_hierarchy())
       if self.params.model_id is not None:
@@ -2566,6 +2821,7 @@ NOTES:
       outString += self._dod_renamed_note
       outString += self._unknown_atoms_note
       outString += self._metal_thiol_note
+      outString += self._ProtonationText()
       outString += self._UnchangedText()
       if neutron:
         self._CheckAmbiguousParents()
@@ -2585,6 +2841,8 @@ NOTES:
         outString += self._dod_renamed_note
         outString += self._unknown_atoms_note
         outString += self._metal_thiol_note
+        # its text goes here, written after the Optimizer (acid H angles)
+        protonationAt = len(outString)
         outString += self._UnchangedText()
         if neutron:
           self._CheckAmbiguousParents()
@@ -2649,7 +2907,8 @@ NOTES:
         cliqueOutlineFileName=self.params.output.clique_outline_file_name,
         fillAtomDump = self.params.output.print_atom_info,
         stopOptimizingAt = stopTime,
-        symmetryCopies = symmetryCopies)
+        symmetryCopies = symmetryCopies,
+        fixedHisProtonation = self._FixedHisKeys())
       doneOpt = time.time()
       if opt.getSymmetryCopiesSummary():
         print(opt.getSymmetryCopiesSummary(), file=self.logger)
@@ -2700,6 +2959,8 @@ NOTES:
           a.parent().remove_atom(a)
 
       if self.params.approach == 'add':
+        outString = (outString[:protonationAt] +
+          self._ProtonationText(optimized=True) + outString[protonationAt:])
         outString += 'Time to Add Hydrogen = {:.3f} sec'.format(doneAdd-startAdd)+'\n'
       outString += 'Time to Optimize = {:.3f} sec'.format(doneOpt-startOpt)+'\n'
       if self.params.output.print_atom_info:
@@ -3036,7 +3297,8 @@ NOTES:
             nonFlipPreference=self.params.non_flip_preference,
             skipBondFixup=self.params.skip_bond_fix_up,
             flipStates = flipStates,
-            verbosity=3)
+            verbosity=3,
+            fixedHisProtonation = self._FixedHisKeys())
           print('Results of optimization:', file=self.logger)
           print(opt.getInfo(), file=self.logger)
           self._ReinterpretModel()
@@ -3159,7 +3421,8 @@ NOTES:
             nonFlipPreference=self.params.non_flip_preference,
             skipBondFixup=self.params.skip_bond_fix_up,
             flipStates = flipStates,
-            verbosity=3)
+            verbosity=3,
+            fixedHisProtonation = self._FixedHisKeys())
           print('Results of optimization:', file=self.logger)
           print(opt.getInfo(), file=self.logger)
           self._ReinterpretModel()

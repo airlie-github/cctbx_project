@@ -674,31 +674,52 @@ def exercise_loop_show_quoting():
     "say \"hi\" 'x'", "\nsemi\n", "\nline1\nline2\n", "ok"]
   assert list(block["_m.tail"]) == ["a", "b", "c", "d"]
 
-def exercise_quoting_scan_matches_format_value():
-  # the per-column scan of loop.show() must flag every value format_value
-  # changes, and a value flex.double accepts must never be changed
+def exercise_quoting_scan():
+  # the per-column scan of loop.show() flags a value exactly when
+  # format_value changes it or it holds a newline (a text field, kept out
+  # of the column width), and a value flex.double accepts is never changed
   probes = ["", " ", "a", "a b", " a", "a ", "a\tb", "a\nb", "\n", "a\rb",
             "a\x0bb", "a\x0cb", "'", "'a", "'a b'", "'a'", '"a"', '"a b"',
-            "#a", "$a", "[a", "]a", "_a", ";a", ";a;", ";\na\n;", "a'b",
-            'a"b', "a#b", "a$b", "a_b", "a;b", "a[b]", "?", ".", "..",
-            "1", "-1", "+1", "1.5", ".5", "1.", "1e5", "1E-5", "0x10",
-            "nan", "inf", "-inf", "NaN", "Infinity", "-0", "1,2", "1_000",
-            "abc", "abc's", "o", "f", "x"]
+            "'a b' x", "'a'b", "'ab\"", "'a\x01b", "'a\x01 b", "'\xe9'",
+            "'\xe9 '", "#a", "$a", "[a", "]a", "_a", ";a", ";a;", ";\na\n;",
+            " ;a;", "\xa0;a;", "\xa0;a", "\xa0a", "a;b;", "a'b", 'a"b',
+            "a#b", "a$b", "a_b", "a;b", "a[b]", "?", ".", "..", "1", "-1",
+            "+1", "1.5", ".5", "1.", "1e5", "1E-5", "0x10", "nan", "inf",
+            "-inf", "NaN", "Infinity", "-0", "1,2", "1_000", "abc", "abc's",
+            "o", "f", "x", "\xe9", "x\xa0y", "\u2003", "a\x1c",
+            # newline values format_value leaves alone
+            "\n;a;\n", "'a'\nb"]
   for value in probes:
     column = flex.std_string([value])
-    flagged = model._column_may_need_quoting(column)
-    assert flagged or model.format_value(value) == value, repr(value)
+    changed = model.format_value(value) != value
+    flagged = model._column_needs_format_value(column)
+    assert flagged == (changed or "\n" in value), repr(value)
     try:
       flex.double(column)
     except ValueError:
       continue
-    assert model.format_value(value) == value, repr(value)
+    assert not changed, repr(value)
     assert model._is_numeric_column(column), repr(value)
-  # a value that needs quoting is found past the first chunk of the scan
-  column = flex.std_string(model._show_chunk_rows + 10, "x")
-  assert not model._column_may_need_quoting(column)
-  column[model._show_chunk_rows + 5] = "a b"
-  assert model._column_may_need_quoting(column)
+  assert not model._column_needs_format_value(flex.std_string())
+  # the flagged value at any position of a column
+  for value in ("", "a b", "#a", "a\nb", "\xa0;a;"):
+    for i in range(5):
+      column = flex.std_string(5, "x")
+      column[i] = value
+      assert model._column_needs_format_value(column), (repr(value), i)
+  assert not model._column_needs_format_value(flex.std_string(5, "x"))
+  # a pre-formatted text field does not widen its column
+  loop = model.loop(data=OrderedDict((
+    ("_p.id", ("1", "2")),
+    ("_p.text", ("\n;a long preformatted text field\n;\n", "x")),
+    ("_p.tail", ("A", "B")),
+  )))
+  s = StringIO()
+  loop.show(out=s)
+  assert not show_diff(s.getvalue(),
+    "loop_\n  _p.id\n  _p.text\n  _p.tail\n"
+    "  1  \n;a long preformatted text field\n;\n  A\n"
+    "  2  x  B\n")
 
 def exercise_loop_show_many_rows():
   # more rows than show() prints at a time
@@ -714,11 +735,158 @@ def exercise_loop_show_many_rows():
   loop.show(out=s)
   assert s.getvalue() == "\n".join(expected) + "\n"
 
+def exercise_format_rows_python():
+  cols = [flex.std_string(["1", "22", "?"]),
+          flex.std_string(["a", "bb", "ccc"])]
+  out = model._format_rows_python(cols, 0, 3, "  ", [2, -3])
+  assert out == "   1  a\n  22  bb\n   ?  ccc\n", repr(out)
+  out = model._format_rows_python(cols, 1, 3, "  ", [])
+  assert out == "  22 bb\n  ? ccc\n", repr(out)
+
+class python_references(object):
+  """While active, loop.show() runs through the retained Python references
+  of its C++ helpers."""
+  references = (("_format_rows", "_format_rows_python"),
+                ("_is_numeric_column", "_flex_double_accepts"))
+  def __enter__(self):
+    self.saved = [(n, getattr(model, n)) for n, r in self.references]
+    for n, r in self.references:
+      setattr(model, n, getattr(model, r))
+  def __exit__(self, *args):
+    for n, f in self.saved:
+      setattr(model, n, f)
+
+def exercise_format_rows_parity():
+  from iotbx.cif import ext
+  cases = {
+    "numeric":   ([["1.5", "22", ".", "?"], ["a", "bb", "ccc", "d"]], [4, -3]),
+    "trailing":  ([["x", "y"], ["a  ", "b"]], [-1, -3]),
+    "textfield": ([["1", "2"], ["\n;long text\n;\n", "b"]], [1, -1]),
+    "utf8":      ([["\xe9", "ab"], ["1", "2"]], [-2, 1]),
+    "unaligned": ([["1", "22"], ["a", "bb"]], []),
+    # the strip removes what str.rstrip() removes, so an unquoted last
+    # value loses a trailing Unicode space or separator: parity with the
+    # Python path, not a feature
+    "pyspace":   ([["x", "y", "z"], ["a\x1c", "b\xa0", "c\u2003"]], [1, -4]),
+  }
+  for name, (raw, widths) in cases.items():
+    cols = [flex.std_string(c) for c in raw]
+    n = cols[0].size()
+    for prefix in ("", "  ", "\t"):
+      ref = model._format_rows_python(cols, 0, n, prefix, widths)
+      got = ext.format_loop_rows(cols, 0, n, prefix, widths)
+      assert got == ref, (name, prefix, repr(got), repr(ref))
+  # chunks: any split gives the same bytes
+  cols = [flex.std_string([str(i) for i in range(7)]),
+          flex.std_string(["v%d" % i for i in range(7)])]
+  w = [2, -3]
+  whole = ext.format_loop_rows(cols, 0, 7, " ", w)
+  for k in range(8):
+    assert ext.format_loop_rows(cols, 0, k, " ", w) + \
+           ext.format_loop_rows(cols, k, 7, " ", w) == whole
+  assert ext.format_loop_rows(cols, 3, 3, " ", w) == ""
+  for bad in ((0, 8), (5, 3)):
+    try: ext.format_loop_rows(cols, bad[0], bad[1], "", [])
+    except ValueError: pass
+    else: raise AssertionError(bad)
+  # loop.show() writes the same bytes through C++ as through the references
+  s1 = StringIO(); s2 = StringIO()
+  lp = model.loop(data={"_a.x": flex.std_string(["1", "2"]),
+                        "_a.y": flex.std_string(["p q", "r"])})
+  lp.show(out=s1)
+  with python_references():
+    lp.show(out=s2)
+  assert s1.getvalue() == s2.getvalue()
+  assert model._format_rows is not model._format_rows_python
+
+def exercise_numeric_column_parity():
+  # _is_numeric_column decides the alignment of a column; the C++ scan of
+  # plain numbers plus flex.double on the rest must give the answer of
+  # flex.double on the whole column
+  import random
+  from iotbx.cif import ext
+  probes = ["1", "-1", "+1", "1.5", ".5", "1.", "1e5", "1E-5", "0x10",
+            "nan", "inf", "-inf", "NaN", "Infinity", "-0", "1,2", "1_000",
+            "1(2)", "1.5(12)", "1e400", "1e-400", " 1", "1 ", "", "1d5",
+            "0x1p3", "nan(1)", "1e", "e5", "--1", "1.2.3", "1e+5", "+.5",
+            "-.5e-3", "5.", "1(", "1)", "1()", "(2)", "1(2", "1.0e+00",
+            "00012", "1e0005", "12345678901234567890", "1e308", "1e309",
+            "4.9e-324", "1\t", "1\n", "Inf", "-nan", "1E", "1e+", "1.e5",
+            ".e5", ".", "?", "..", "1.5+03", "1.5-03", "+", "-", "e",
+            "1e99", "1e-99", "0" * 39 + "1", "1" + "0" * 39, "1" * 41,
+            "1e100", "1e-100", "\xe9", "1\xe9", "abc"]
+  for value in probes:
+    for column in (flex.std_string([value]),
+                   flex.std_string([".", "1", value, "?"]),
+                   flex.std_string(["1.5", value, "nan"])):
+      assert model._is_numeric_column(column) == \
+        model._flex_double_accepts(column), (repr(value), list(column))
+  assert model._is_numeric_column(flex.std_string())
+  assert model._is_numeric_column(flex.std_string([".", "?"]))
+  # the scan: index of the first value that is neither ., ? nor a plain
+  # number, from a start index; the size when there is none
+  column = flex.std_string(["1", ".", "nan", "2", "?", "x"])
+  assert ext.first_non_plain_number(column, 0) == 2
+  assert ext.first_non_plain_number(column, 3) == 5
+  assert ext.first_non_plain_number(column, 6) == 6
+  assert ext.first_non_plain_number(flex.std_string(["1", "2"]), 0) == 2
+  # every plain number the scan accepts is accepted by flex.double, and
+  # a mutation of one is judged alike by both paths
+  random.seed(0)
+  def digits():
+    return "".join(random.choice("0123456789")
+                   for i in range(random.randrange(1, 12)))
+  def plain():
+    s = random.choice(["", "+", "-"])
+    kind = random.randrange(3)
+    if kind == 0: s += digits()
+    elif kind == 1: s += digits() + "." + random.choice(["", digits()])
+    else: s += "." + digits()
+    if random.randrange(2):
+      s += random.choice("eE") + random.choice(["", "+", "-"]) \
+         + "".join(random.choice("0123456789")
+                   for i in range(random.randrange(1, 3)))
+    return s
+  for i in range(3000):
+    value = plain()
+    column = flex.std_string([value])
+    assert ext.first_non_plain_number(column, 0) == 1, repr(value)
+    flex.double(column)
+    j = random.randrange(len(value) + 1)
+    mutant = value[:j] + random.choice("e.+- xg()0") + value[j:]
+    column = flex.std_string([value, mutant, "?"])
+    assert model._is_numeric_column(column) == \
+      model._flex_double_accepts(column), repr(mutant)
+  # values the scan leaves to flex.double go one at a time up to
+  # _numeric_single_values, then the rest of the column in one call
+  sizes = []
+  class counting_flex(object):
+    @staticmethod
+    def double(values):
+      sizes.append(values.size())
+      return flex.double(values)
+  model.flex = counting_flex
+  try:
+    column = flex.std_string(5000, "nan")
+    assert model._is_numeric_column(column)
+    assert sizes == [1] * model._numeric_single_values + [5000], sizes
+    column[4999] = "x"
+    assert not model._is_numeric_column(column)
+    column = flex.std_string(5000, "1.5(3)")
+    column[3000] = "1.5("
+    assert not model._is_numeric_column(column)
+  finally:
+    model.flex = flex
+  assert model._is_numeric_column is not model._flex_double_accepts
+
 if __name__ == '__main__':
   exercise_cif_model()
   test_301()
   test_show_not_modify()
   exercise_loop_show_quoting()
-  exercise_quoting_scan_matches_format_value()
+  exercise_quoting_scan()
   exercise_loop_show_many_rows()
+  exercise_format_rows_python()
+  exercise_format_rows_parity()
+  exercise_numeric_column_parity()
   print("OK")

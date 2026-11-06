@@ -11,6 +11,8 @@ try:
 except ImportError:
   from collections import MutableMapping
 from cctbx.array_family import flex
+import boost_adaptbx.boost.python as bp
+ext = bp.import_ext("iotbx_cif_ext")
 from six.moves import range
 from six.moves import zip
 from six import string_types
@@ -489,39 +491,21 @@ class block(block_base):
     new.saves = self.saves.copy()
     return new
 
-# The rows loop.show() converts to Python strings at a time.  Only a column
-# that needs quoting is formatted whole, so a big loop costs at most one
-# column of Python strings at a time, not the whole loop.
+# Rows per call of the C++ row formatter in loop.show(): bounds the size of
+# the string returned per chunk.
 _show_chunk_rows = 65536
 
-# format_value quotes a value that is empty, that starts with one of these
-# characters, or that contains whitespace (a newline makes it a text field).
-_quoting_leaders = "'\"#$[]_;"
-_blanks = " \t\r\x0b\x0c"   # string.whitespace without the newline
+# True if a value of the column (a flex.std_string) holds a newline or is
+# changed by format_value; such a column goes through format_value.
+_column_needs_format_value = ext.column_needs_format_value
 
-def _column_may_need_quoting(column):
-  """True if format_value may change a value of the column (a
-  flex.std_string).  Conservative: a value that is already a complete quoted
-  string is reported although format_value leaves it alone."""
-  for start in range(0, column.size(), _show_chunk_rows):
-    values = list(column[start:start + _show_chunk_rows])
-    if "" in values:
-      return True
-    joined = "\n" + "\n".join(values)
-    if joined.count("\n") != len(values):
-      return True   # a value contains a newline
-    for c in _blanks:
-      if c in joined:
-        return True
-    for c in _quoting_leaders:
-      if "\n" + c in joined:
-        return True
-  return False
+# Values of a column that are not plain numbers go to flex.double one at a
+# time up to this many, then the whole column goes in one call.
+_numeric_single_values = 64
 
-def _is_numeric_column(column):
-  """True if every value of the column (a flex.std_string), '.' and '?'
-  aside, parses as a number.  loop.show() right-aligns such a column; its
-  values never need quoting."""
+def _flex_double_accepts(column):
+  """True if flex.double accepts every value of the column (a
+  flex.std_string), '.' and '?' aside."""
   values = column.select(~((column == ".") | (column == "?")))
   try:
     flex.double(values)
@@ -529,13 +513,33 @@ def _is_numeric_column(column):
     return False
   return True
 
+def _is_numeric_column(column):
+  """True if every value of the column (a flex.std_string), '.' and '?'
+  aside, parses as a number.  loop.show() right-aligns such a column; its
+  values never need quoting.  Plain numbers are recognised by a C++ scan;
+  flex.double, the authority, judges the values the scan rejects: the
+  first _numeric_single_values one at a time, then the whole column in
+  one call, as before the scan."""
+  n = column.size()
+  i = 0
+  for unused in range(_numeric_single_values):
+    i = ext.first_non_plain_number(column, i)
+    if i == n:
+      return True
+    try:
+      flex.double(column[i:i+1])
+    except ValueError:
+      return False
+    i += 1
+  return _flex_double_accepts(column)
+
 def _printed_column(column, numeric=False):
   """The column (a flex.std_string) as loop.show() prints it and the width
   of its widest value that is not a text field: (values, width).  Every
-  value goes through format_value unless no value can need quoting: a
-  numeric column (numeric=True, decided by the caller) or one for which
-  _column_may_need_quoting is False."""
-  if numeric or not _column_may_need_quoting(column):
+  value goes through format_value unless none needs it: a numeric column
+  (numeric=True, decided by the caller) or one for which
+  _column_needs_format_value is False."""
+  if numeric or not _column_needs_format_value(column):
     return column, column.max_element_length()
   printed = [format_value(value) for value in list(column)]
   # exclude semicolon text fields from column width calculation
@@ -543,14 +547,22 @@ def _printed_column(column, numeric=False):
     [value for value in printed if "\n" not in value]).max_element_length()
   return flex.std_string(printed), width
 
-def _rows_in_chunks(columns, n_rows):
-  """The rows of the columns (flex.std_string of n_rows each) as tuples,
-  _show_chunk_rows at a time."""
-  for column in columns:
-    assert column.size() == n_rows
-  for start in range(0, n_rows, _show_chunk_rows):
-    stop = min(start + _show_chunk_rows, n_rows)
-    yield zip(*[list(column[start:stop]) for column in columns])
+# Rows start to stop of the columns as loop.show() prints them: the
+# contract of format_loop_rows in loop_format.h.
+_format_rows = ext.format_loop_rows
+
+def _format_rows_python(columns, start, stop, prefix, widths):
+  """The Python original of _format_rows, the reference of the parity tests
+  in tst_model.py; to be retired once the C++ path has shipped."""
+  rows = zip(*[list(column[start:stop]) for column in columns])
+  if len(widths) == 0:
+    lines = [prefix + " ".join(row) for row in rows]
+  else:
+    fmt_str = prefix + "  ".join(["%%%is" % width for width in widths])
+    lines = [(fmt_str % row).rstrip() for row in rows]
+  if len(lines) == 0:
+    return ""
+  return "\n".join(lines) + "\n"
 
 
 class loop(MutableMapping):
@@ -729,7 +741,7 @@ class loop(MutableMapping):
         print(fmt_str % tuple([values[j][i] for j in range_len_values]), file=out)
     elif align_columns:
       columns = []
-      fmt_str = []
+      widths = []
       for v in values:
         # right-align numerical columns, left-align everything else
         numeric = _is_numeric_column(v)
@@ -737,16 +749,17 @@ class loop(MutableMapping):
         if not numeric:
           width *= -1
         columns.append(v)
-        fmt_str.append("%%%is" %width)
-      fmt_str = indent_row + "  ".join(fmt_str)
-      for rows in _rows_in_chunks(columns, self.size()):
-        out.write("\n".join([(fmt_str % row).rstrip() for row in rows]))
-        out.write("\n")
+        widths.append(width)
+      self._show_rows(out, columns, indent_row, widths)
     else:
       columns = [_printed_column(v)[0] for v in values]
-      for rows in _rows_in_chunks(columns, self.size()):
-        out.write("\n".join([" ".join((indent,) + row) for row in rows]))
-        out.write("\n")
+      self._show_rows(out, columns, indent + " ", [])
+
+  def _show_rows(self, out, columns, prefix, widths):
+    n = self.size()
+    for start in range(0, n, _show_chunk_rows):
+      out.write(_format_rows(
+        columns, start, min(start + _show_chunk_rows, n), prefix, widths))
 
   def __str__(self):
     s = StringIO()
@@ -876,6 +889,8 @@ unquoted_string_re = re.compile(
 quoted_string_re = re.compile(r"('|\")[%s]*('|\")" %_any_print_char_set)
 semicolon_string_re = re.compile(r"(\s*)(;).*?(;)(\s*)", re.DOTALL)
 
+# column_needs_format_value in loop_format.cpp ports these rules to C++ for
+# loop.show: change both together.
 def format_value(value_string):
   string_is_quoted = False
   if not value_string:
