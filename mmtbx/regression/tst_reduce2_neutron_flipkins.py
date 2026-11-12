@@ -19,7 +19,8 @@ def test_flipkins_combined():
   #   distances: every configuration logs it)
   # - flipkins are made from the H-only self.model: hd_and_h and none with
   #   neutron distances give the same flipkins
-  # - an O-only water named DOD gets H in every pass (renamed HOH)
+  # - an O-only water named DOD gets H after the optimization (renamed HOH);
+  #   the passes leave the waters without H
   # - an orphan water H removed as floating stays out of every flipkin pass;
   #   optimize: a water H the dictionary does not know (H3), which placement
   #   in the passes keeps, too: removed from the snapshot
@@ -37,7 +38,7 @@ def test_flipkins_combined():
   src = {}
   for option in ("none", "hd_and_h"):
     src[option] = cached_run(model, (zq3_cif, zq4_cif), approach="place",
-      neutron_option=option, exclude_water=False).text
+      neutron_option=option, add_h_to_water=True).text
   # H input: water 8 without its O (orphan H1/H2), water 9 O only, as DOD
   lines = []
   for l in src["none"].splitlines():
@@ -70,7 +71,7 @@ def test_flipkins_combined():
   names = lambda m: [n for n, o in (m.get_restraint_objects() or [])]
   def run(prefix, source, ext, directory, **params):
     params.update(keep_existing_H=True, ignore_missing_restraints=True,
-      exclude_water=False, add_flip_movers=True,
+      add_h_to_water=True, add_flip_movers=True,
       output__filename=prefix + "_out" + ext,
       output__description_file_name=prefix + ".txt", output__overwrite=True)
     if directory is not None:

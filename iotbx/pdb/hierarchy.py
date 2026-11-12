@@ -1766,7 +1766,7 @@ class _():
     if hasattr(self, '_label_seq_id_dict'):
       del self._label_seq_id_dict
 
-  def as_cif_block(self,
+  def _as_cif_block_python(self,
       crystal_symmetry=None,
       coordinate_precision=5,
       occupancy_precision=3,
@@ -1775,6 +1775,12 @@ class _():
       resolution_precision=2,
       segid_as_auth_segid=False,
       output_break_records=False):
+    """The Python body of as_cif_block, which writes the atom columns in C++
+    now; kept as the reference of iotbx/regression/tst_mmcif_writer_cpp.py,
+    which asserts that both give the same block. Retirement: remove it after
+    the first Phenix release that ships the C++ path if no parity failure
+    has been reported, with the blocks marked PARITY in that test; its
+    docstring lists the edits that go with them."""
 
     if crystal_symmetry is None:
       crystal_symmetry = crystal.symmetry()
@@ -2031,6 +2037,210 @@ class _():
     for row in struct_asym_ids: struct_asym_loop.add_row([row])
     h_cif_block.add_loop(struct_asym_loop)
     #
+    return h_cif_block
+
+  def _atom_site_labels(self, segid_as_auth_segid=False):
+    """The values of as_cif_block that Python resolves: label_asym_id and
+    label_seq_id, which depend on a residue's neighbours and its chain,
+    auth_asym_id, and auth_seq_id. One value per chain, residue group or
+    atom group, over all models in hierarchy order. The lookups are rebuilt
+    first.
+
+    Parameters
+    ----------
+    segid_as_auth_segid : bool
+      As in as_cif_block: when False, a segid longer than the chain id is
+      the auth_asym_id.
+
+    Returns
+    -------
+    libtbx.group_args
+      chain_auth_asym_id (per chain), rg_label_asym_id and rg_auth_seq_id
+      (per residue group), ag_label_seq_id (per atom group), each a
+      flex.std_string.
+    """
+    self.clear_label_asym_id_lookups()
+    chain_auth_asym_id = []
+    rg_label_asym_id = []
+    rg_auth_seq_id = []
+    ag_label_seq_id = []
+    for model in self.models():
+      for chain in model.chains():
+        chain_auth_asym_id.append(self.get_auth_asym_id(chain,
+          segid_as_auth_segid=segid_as_auth_segid))
+        for residue_group in chain.residue_groups():
+          rg_label_asym_id.append(
+            self.get_label_asym_id(residue_group).strip())
+          rg_auth_seq_id.append(self.get_auth_seq_id(residue_group))
+          for atom_group in residue_group.atom_groups():
+            ag_label_seq_id.append(self.get_label_seq_id(atom_group))
+    return group_args(
+      chain_auth_asym_id=flex.std_string(chain_auth_asym_id),
+      rg_label_asym_id=flex.std_string(rg_label_asym_id),
+      rg_auth_seq_id=flex.std_string(rg_auth_seq_id),
+      ag_label_seq_id=flex.std_string(ag_label_seq_id))
+
+  def as_cif_block(self,
+      crystal_symmetry=None,
+      coordinate_precision=5,
+      occupancy_precision=3,
+      b_iso_precision=5,
+      u_aniso_precision=5,
+      resolution_precision=2,
+      segid_as_auth_segid=False,
+      output_break_records=False):
+    """Return the model as an mmCIF data block.
+
+    Parameters
+    ----------
+    crystal_symmetry : cctbx.crystal.symmetry, optional
+      Written as the cell and space group items; None writes neither.
+    coordinate_precision : int
+      Decimal places of _atom_site.Cartn_x, Cartn_y and Cartn_z.
+    occupancy_precision : int
+      Decimal places of _atom_site.occupancy.
+    b_iso_precision : int
+      Decimal places of _atom_site.B_iso_or_equiv.
+    u_aniso_precision : int
+      Decimal places of the _atom_site_anisotrop U values.
+    resolution_precision : int
+      Decimal places of _atom_site.phenix_resolution.
+    segid_as_auth_segid : bool
+      Write the segid as _atom_site.auth_segid. When False, a segid longer
+      than the chain id is written as auth_asym_id instead.
+    output_break_records : bool
+      Write _atom_site.auth_break when the hierarchy has chain breaks.
+
+    Returns
+    -------
+    iotbx.cif.model.block
+      The _atom_site loop, the _atom_site_anisotrop loop when an atom has
+      U values, the symmetry items, and the _chem_comp and _struct_asym
+      loops.
+
+    Raises
+    ------
+    ValueError
+      For an atom serial that is not a hybrid-36 number in a single-model
+      hierarchy, for a four-character residue number that is not a
+      hybrid-36 number, and for a negative precision when a value is
+      written with it.
+    IndexError
+      For a residue group without atom groups, for a chain without atoms
+      when segid_as_auth_segid is False, and for a chain with a blank id
+      and no residue groups when it is True.
+
+    Notes
+    -----
+    The per-chain and per-residue values come from _atom_site_labels; the
+    per-atom values are written in C++ by
+    iotbx.pdb.atom_site_columns_from_hierarchy. The block is the same as
+    that of _as_cif_block_python, the Python body this replaced, with two
+    exceptions. label_alt_id is the altloc of the atom group that holds the
+    atom; the Python body read the altloc of atom.parent(). The two differ
+    when parent() is another atom group or None: atoms added with
+    atom_group.append_atom_with_other_parent, the atoms of a select()
+    without copy_atoms (their parents are the original's atom groups), and
+    the atoms such a selection shares with its original after
+    remove_alt_confs() or remove_hd() on either; where the Python body
+    raised AttributeError for a parent of None, the block is written.
+    And the labels of all chains are resolved before any atom is written,
+    so an input with two defects can raise the exception of the later one
+    (an IndexError for an empty chain B before the ValueError for a bad
+    serial in chain A). On an x86 build with -ffast-math, which no CI job
+    that runs the iotbx tests, and no released build, uses, a NaN fp or fdp
+    counts as zero, so an atom whose other value is 0 or NaN gets "." in
+    both columns.
+    """
+    from iotbx.pdb import atom_site_labels, atom_site_columns_from_hierarchy
+    if crystal_symmetry is None:
+      crystal_symmetry = crystal.symmetry()
+    cs_cif_block = crystal_symmetry.as_cif_block(format="mmcif")
+    if output_break_records:
+      # Determine if there are any break records here to write out
+      if not self.contains_break_records():
+        output_break_records = False # no point
+    values = self._atom_site_labels(segid_as_auth_segid=segid_as_auth_segid)
+    labels = atom_site_labels()
+    labels.chain_auth_asym_id = values.chain_auth_asym_id
+    labels.rg_label_asym_id = values.rg_label_asym_id
+    labels.rg_auth_seq_id = values.rg_auth_seq_id
+    labels.ag_label_seq_id = values.ag_label_seq_id
+    out = atom_site_columns_from_hierarchy(self, labels,
+      coordinate_precision=coordinate_precision,
+      occupancy_precision=occupancy_precision,
+      b_iso_precision=b_iso_precision,
+      u_aniso_precision=u_aniso_precision,
+      resolution_precision=resolution_precision,
+      segid_as_auth_segid=segid_as_auth_segid,
+      output_break_records=output_break_records)
+
+    atom_site_columns = [
+      ('_atom_site.group_PDB', out.group_pdb),
+      ('_atom_site.id', out.id),
+      ('_atom_site.label_atom_id', out.label_atom_id),
+      ('_atom_site.label_alt_id', out.label_alt_id),
+      ('_atom_site.label_comp_id', out.label_comp_id),
+      ('_atom_site.auth_asym_id', out.auth_asym_id),
+      ('_atom_site.auth_seq_id', out.auth_seq_id),
+      ('_atom_site.pdbx_PDB_ins_code', out.ins_code),
+      ('_atom_site.Cartn_x', out.cartn_x),
+      ('_atom_site.Cartn_y', out.cartn_y),
+      ('_atom_site.Cartn_z', out.cartn_z),
+      ('_atom_site.occupancy', out.occupancy),
+      ('_atom_site.B_iso_or_equiv', out.b_iso),
+      ('_atom_site.type_symbol', out.type_symbol),
+      ('_atom_site.pdbx_formal_charge', out.formal_charge),
+      ('_atom_site.phenix_resolution', out.resolution),
+      ('_atom_site.phenix_scat_dispersion_real', out.fp),
+      ('_atom_site.phenix_scat_dispersion_imag', out.fdp),
+      ('_atom_site.label_asym_id', out.label_asym_id),
+      ('_atom_site.label_entity_id', out.label_entity_id),
+      ('_atom_site.label_seq_id', out.label_seq_id),
+      ('_atom_site.auth_atom_id', out.auth_atom_id),
+      ('_atom_site.pdbx_PDB_model_num', out.model_num),
+     ]
+    if segid_as_auth_segid:
+      atom_site_columns.append(('_atom_site.auth_segid', out.auth_segid))
+    if output_break_records:
+      atom_site_columns.append(('_atom_site.auth_break', out.auth_break))
+    atom_site_loop = iotbx.cif.model.loop()
+    for key, column in atom_site_columns:
+      atom_site_loop[key] = column
+    aniso_loop = iotbx.cif.model.loop()
+    for key, column in (
+        ('_atom_site_anisotrop.id', out.aniso_id),
+        ('_atom_site_anisotrop.pdbx_auth_atom_id', out.aniso_auth_atom_id),
+        ('_atom_site_anisotrop.pdbx_label_alt_id', out.aniso_label_alt_id),
+        ('_atom_site_anisotrop.pdbx_auth_comp_id', out.aniso_auth_comp_id),
+        ('_atom_site_anisotrop.pdbx_auth_asym_id', out.aniso_auth_asym_id),
+        ('_atom_site_anisotrop.pdbx_auth_seq_id', out.aniso_auth_seq_id),
+        ('_atom_site_anisotrop.pdbx_PDB_ins_code', out.aniso_ins_code),
+        ('_atom_site_anisotrop.U[1][1]', out.aniso_u11),
+        ('_atom_site_anisotrop.U[2][2]', out.aniso_u22),
+        ('_atom_site_anisotrop.U[3][3]', out.aniso_u33),
+        ('_atom_site_anisotrop.U[1][2]', out.aniso_u12),
+        ('_atom_site_anisotrop.U[1][3]', out.aniso_u13),
+        ('_atom_site_anisotrop.U[2][3]', out.aniso_u23)):
+      aniso_loop[key] = column
+
+    for key in ('_atom_site.phenix_scat_dispersion_real',
+                '_atom_site.phenix_scat_dispersion_imag'):
+      if atom_site_loop[key].all_eq('.'):
+        del atom_site_loop[key]
+    if atom_site_loop['_atom_site.phenix_resolution'].all_eq('0.00'):
+      del atom_site_loop['_atom_site.phenix_resolution']
+    h_cif_block = iotbx.cif.model.block()
+    h_cif_block.add_loop(atom_site_loop)
+    if aniso_loop.size() > 0:
+      h_cif_block.add_loop(aniso_loop)
+    h_cif_block.update(cs_cif_block)
+    chem_comp_loop = iotbx.cif.model.loop(header=('_chem_comp.id',))
+    for row in out.chem_comp_ids: chem_comp_loop.add_row([row])
+    h_cif_block.add_loop(chem_comp_loop)
+    struct_asym_loop = iotbx.cif.model.loop(header=('_struct_asym.id',))
+    for row in out.struct_asym_ids: struct_asym_loop.add_row([row])
+    h_cif_block.add_loop(struct_asym_loop)
     return h_cif_block
 
   def remove_segid(self):
@@ -2569,6 +2779,13 @@ class _():
     else:
       sentinel = self.atoms().reset_tmp(first_value=0, increment=1)
     result = []
+    # Groups come only from atom groups with an altloc and from atoms with
+    # 0 < occ < 1: without either the result is empty.
+    occ = self.atoms().extract_occ()
+    if (set(self.altloc_indices().keys()) <= {""} and
+        ((occ > 0) & (occ < 1)).count(True) == 0):
+      del sentinel
+      return result
     for chain in self.chains():
       if(common_residue_name_class_only is None):
         if(chain.is_protein()):
