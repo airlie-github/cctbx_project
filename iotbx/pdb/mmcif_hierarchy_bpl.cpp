@@ -53,6 +53,9 @@ namespace iotbx { namespace pdb { namespace boost_python {
       atom.set_name(name.c_str());
       atom.set_element(element.c_str());
       atom.set_charge(charge.c_str());
+      // the label, element and charge of the row, for the messages
+      std::string const where = label + " type_symbol \"" + element
+        + "\" charge \"" + charge + "\"";
       if (atom.data->element == "IS") {
         std::string ias_type;
         for(std::size_t i=0;i<2;i++) {
@@ -62,7 +65,7 @@ namespace iotbx { namespace pdb { namespace boost_python {
         }
         if (ias_type.size() == 0) {
           throw std::invalid_argument(
-            "Unknown chemical element type:\n  " + label + "\n");
+            "Unknown chemical element type:\n  " + where + "\n");
         }
         return "IS" + ias_type;
       }
@@ -70,12 +73,12 @@ namespace iotbx { namespace pdb { namespace boost_python {
         chemical_element = atom.determine_chemical_element_simple();
       if (!chemical_element && !enable_scattering_type_unknown) {
         throw std::invalid_argument(
-          "Unknown chemical element type:\n  " + label + "\n");
+          "Unknown chemical element type:\n  " + where + "\n");
       }
       boost::optional<std::string> charge_tidy = atom.charge_tidy();
       if (!charge_tidy) {
         if (!enable_scattering_type_unknown) {
-          throw std::invalid_argument("Unknown charge:\n  " + label);
+          throw std::invalid_argument("Unknown charge:\n  " + where);
         }
         chemical_element.reset();
       }
@@ -86,7 +89,7 @@ namespace iotbx { namespace pdb { namespace boost_python {
       }
       if (scattering_type) return *scattering_type;
       if (enable_scattering_type_unknown) return "unknown";
-      throw std::invalid_argument("Unknown scattering type:\n  " + label);
+      throw std::invalid_argument("Unknown scattering type:\n  " + where);
     }
 
     //! The scatterers of an _atom_site loop, in row order: the scatterers
@@ -99,11 +102,9 @@ namespace iotbx { namespace pdb { namespace boost_python {
       bool scattering_type_exact,
       bool enable_scattering_type_unknown)
     {
-      mmcif::atom_site_rows rows;
-      {
-        gil_release guard;
-        rows = mmcif::parse_atom_site_rows(columns);
-      }
+      // touches no Python object, as build_hierarchy_without_gil
+      gil_release guard;
+      mmcif::atom_site_rows rows = mmcif::parse_atom_site_rows(columns);
       const std::size_t n = rows.label.size();
       af::shared<cctbx::xray::scatterer<> > result;
       result.reserve(n);

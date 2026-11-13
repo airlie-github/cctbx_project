@@ -380,10 +380,11 @@ def hierarchy_from_atom_site(cif_block):
 def xray_structure_from_atom_site(cif_block, crystal_symmetry=None,
     enable_scattering_type_unknown=False, min_distance_sym_equiv=0.5):
   """
-  The xray.structure of the _atom_site loop of a model mmCIF block, built
-  from the columns without the hierarchy: the structure of
-  hierarchy_from_atom_site(cif_block).extract_xray_structure() with its
-  scatterers in row order.
+  Build the xray.structure of a model block without the hierarchy.
+
+  The scatterers are those of
+  hierarchy_from_atom_site(cif_block).extract_xray_structure(), in the row
+  order of the _atom_site loop.
 
   Parameters
   ----------
@@ -395,7 +396,7 @@ def xray_structure_from_atom_site(cif_block, crystal_symmetry=None,
     Give an atom with no known scattering type the type "unknown" instead
     of raising.
   min_distance_sym_equiv : float
-    As for extract_xray_structure.
+    As for extract_xray_structure, whose None means 0.5.
 
   Returns
   -------
@@ -406,8 +407,10 @@ def xray_structure_from_atom_site(cif_block, crystal_symmetry=None,
   Raises
   ------
   iotbx.cif.builders.CifBuilderError
-    A bad cell (as hierarchy_from_atom_site), an atom with no scattering
-    type, or a block without crystal symmetry.
+    A bad _atom_site value (as hierarchy_from_atom_site), an atom with no
+    scattering type, or a block without crystal symmetry.
+  AssertionError
+    A missing label column, as from atom_site_columns_from_block.
   """
   from cctbx import xray
   import scitbx.stl.set
