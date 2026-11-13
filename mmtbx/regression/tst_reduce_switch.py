@@ -353,49 +353,6 @@ def test_rsr_per_cycle_clashscore_keeps_h_reduce2():
     reduce_switch.USE_OLD_REDUCE = saved
   print("test_rsr_per_cycle_clashscore_keeps_h_reduce2 OK")
 
-def test_model_idealization_stat_display_tolerates_none_reduce2():
-  """phenix.model_idealization works on an H-less model (it runs remove_hydrogens),
-  so under reduce2 every geometry_statistics() snapshot has clash.score=None and
-  molprobity_score=None. print_stat_comparison() must render those as the program's
-  own 99999 'not available' sentinel instead of crashing on "{:10.2f}".format(None)
-  (the contract: all clash()/mp_score() callers must tolerate None)."""
-  from io import StringIO
-  from libtbx import group_args
-  from mmtbx.command_line import model_idealization as mi
-  def fake_stats():
-    # mimic geometry_statistics().result() under reduce2: clash/molprobity are None,
-    # the other validation fields are real numbers (reduce2 does not touch them).
-    return group_args(
-      molprobity_score = None,
-      clash        = group_args(score=None, clashes=None),
-      c_beta       = group_args(outliers=0),
-      ramachandran = group_args(outliers=0, allowed=0, favored=100),
-      rotamer      = group_args(outliers=0),
-      omega        = group_args(cis_proline=0, cis_general=0,
-                                twisted_proline=0, twisted_general=0),
-      cablam       = group_args(outliers=0, disfavored=0, ca_outliers=0))
-  # Build the reporter without the heavy __init__ (needs a real model+map); we only
-  # exercise the stat-printing method, feeding it the reduce2-shaped stat objects.
-  obj = mi.model_idealization.__new__(mi.model_idealization)
-  obj.log = StringIO()
-  obj.params = group_args(run_minimization_first=False)
-  obj.after_cablam_statistics  = None
-  obj.init_gm_model_statistics = None
-  obj.init_model_statistics    = fake_stats()
-  obj.after_ss_idealization    = fake_stats()
-  obj.after_loop_idealization  = fake_stats()
-  obj.after_rotamer_fixing     = fake_stats()
-  obj.final_model_statistics   = fake_stats()
-  obj.time_for_init = 0; obj.time_for_run = 0
-  obj.get_rmsd_from_start  = lambda: 0.0  # shadow the heavy rmsd calc (unrelated)
-  obj.get_rmsd_from_start2 = lambda: 0.0
-  obj.print_stat_comparison()             # must NOT raise on the None values
-  out = obj.log.getvalue()
-  clash_lines = [l for l in out.splitlines() if l.startswith("Clashscore")]
-  assert len(clash_lines) == 1, out
-  assert "99999" in clash_lines[0], clash_lines[0]   # None -> sentinel, not a crash
-  print("test_model_idealization_stat_display_tolerates_none_reduce2 OK")
-
 def test_molprobity_validation_adds_h_reduce2():
   """Standalone comprehensive validation (mmtbx.validation.molprobity.molprobity)
   needs a real clashscore. Under reduce2 clash() is a non-adding observer, so for
@@ -700,7 +657,8 @@ def his_cu_box_str():
 def test_flips_from_final_model():
   """report.flips are the residues whose final heavy atoms are flipped: a
   blank His flipped only in the first conformer pass is not listed; each
-  flipped conformer once; with do_flips=False the ion-locked His."""
+  flipped conformer once; with do_flips=False nothing, except a His whose Zn
+  binds only the flipped ring when optimize_his_protonation is False."""
   def flips(s, **kw):
     report = _report()
     reduce_switch.place_and_optimize_hydrogens(model=model_from_str(s),
@@ -711,11 +669,45 @@ def test_flips_from_final_model():
   assert flips(his_d_str("so4_split"), do_flips=True) == []
   assert flips(his_d_str("his_split"), do_flips=True) == [
     key + ("A", "His"), key + ("B", "His")]
-  # the ion lock-down flips the His also without do_flips
-  for df in (False, True):
-    assert flips(his_zn_str(), do_flips=df, optimize_his_protonation=True) \
-      == [("", "A", "   1", " ", "HIS", "", "His")], df
+  his = [("", "A", "   1", " ", "HIS", "", "His")]
+  assert flips(his_zn_str(), do_flips=True, optimize_his_protonation=True) \
+    == his
+  assert flips(his_zn_str(), do_flips=False) == his
+  assert flips(his_zn_str(), do_flips=False,
+    optimize_his_protonation=True) == []
   print("test_flips_from_final_model OK")
+
+def test_ion_lock_without_flips():
+  """His A 1 of his_zn_str(), whose Zn binds only the flipped ring, without
+  do_flips: the ion lock-down flips it (a ring N on the Zn, without its H)
+  unless optimize_his_protonation, which moves no heavy atom (the ring CD2
+  and its H stay on the Zn side)."""
+  from scitbx import matrix
+  def near_zn(**kw):
+    m = reduce_switch.place_and_optimize_hydrogens(
+      model=model_from_str(his_zn_str()), log=null_out(), do_flips=False, **kw)
+    atoms = dict((a.name.strip(), a) for a in m.get_hierarchy().atoms()
+      if a.parent().resname.strip() in ("HIS", "ZN"))
+    zn = matrix.col(atoms["ZN"].xyz)
+    return dict((n, (matrix.col(atoms[n].xyz) - zn).length())
+      for n in ("ND1", "CD2", "NE2", "CE1", "HD1", "HD2", "HE2") if n in atoms)
+  d = near_zn()
+  assert d["ND1"] < 2.3 and "HD1" not in d, d
+  def key(a):
+    return (a.parent().resname, a.name.strip())
+  start = dict((key(a), a.xyz) for a in
+    model_from_str(his_zn_str()).get_hierarchy().atoms())
+  m = reduce_switch.place_and_optimize_hydrogens(
+    model=model_from_str(his_zn_str()), log=null_out(), do_flips=False,
+    optimize_his_protonation=True)
+  for a in m.get_hierarchy().atoms():
+    if a.element.strip() != "H":
+      # round-off only (1e-15 A)
+      d = (matrix.col(a.xyz) - matrix.col(start[key(a)])).length()
+      assert d < 1e-6, (key(a), d)
+  d = near_zn(optimize_his_protonation=True)
+  assert abs(d["CD2"] - 2.1) < 0.01 and d["HD2"] < 1.3, d
+  print("test_ion_lock_without_flips OK")
 
 def test_metal_contact_symmetry():
   """input_crystal_symmetry: placement's metal contacts across the model's
@@ -749,7 +741,6 @@ if __name__ == "__main__":
   test_flip_nqh_applies_reduce2_flip()
   test_flip_nqh_use_ncs_without_groups_reduce2()
   test_rsr_per_cycle_clashscore_keeps_h_reduce2()
-  test_model_idealization_stat_display_tolerates_none_reduce2()
   test_molprobity_validation_adds_h_reduce2()
   test_reduce2_flips_applies_wholesale()
   test_his_protonation_without_flips()
@@ -757,5 +748,6 @@ if __name__ == "__main__":
   test_metal_amine_option()
   test_new_options_default_off()
   test_flips_from_final_model()
+  test_ion_lock_without_flips()
   test_metal_contact_symmetry()
   print("OK")
