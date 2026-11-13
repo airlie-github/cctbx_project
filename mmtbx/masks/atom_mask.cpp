@@ -503,75 +503,6 @@ namespace mmtbx { namespace masks {
       versa_3d_padded_real_array;
     typedef scitbx::af::versa<std::complex<double>, padded_grid_t >
       versa_3d_padded_complex_array;
-
-    // scitbx::fftpack::real_to_complex_3d forward, without the transforms
-    // of lines that are zero because they miss the asu box, nor of lines
-    // that only reach coefficients no requested index reads
-    void forward_in_asu_box(
-      const scitbx::af::ref<double, padded_grid_t > &map,
-      const std::vector<char> &nonzero_x,
-      const std::vector<char> &nonzero_y,
-      const std::vector<char> &needed_y,
-      int n_needed_z)
-    {
-      const int nx = static_cast<int>(map.accessor().focus()[0]);
-      const int ny = static_cast<int>(map.accessor().focus()[1]);
-      const int nz = static_cast<int>(map.accessor().focus()[2]);
-      scitbx::fftpack::complex_to_complex<double> fft1d_x(nx);
-      scitbx::fftpack::complex_to_complex<double> fft1d_y(ny);
-      scitbx::fftpack::real_to_complex<double> fft1d_z(nz);
-      const int nzc = std::min(
-        static_cast<int>(fft1d_z.n_complex()), n_needed_z);
-      const int seq_size = 2 * std::max(std::max(nx, ny),
-        static_cast<int>(fft1d_z.n_complex()));
-#if defined(_OPENMP)
-      #pragma omp parallel
-#endif
-      {
-        std::vector<double> seq_and_scratch(2 * seq_size);
-        double *seq = &seq_and_scratch[0];
-        double *scratch = seq + seq_size;
-#if defined(_OPENMP)
-        #pragma omp for
-#endif
-        for (int ix = 0; ix < nx; ix++) {
-          if (!nonzero_x[ix]) continue;
-          for (int iy = 0; iy < ny; iy++) {
-            if (nonzero_y[iy]) fft1d_z.forward(&map(ix, iy, 0), scratch);
-          }
-          for (int iz = 0; iz < nzc; iz++) {
-            for (int iy = 0; iy < ny; iy++) {
-              seq[2*iy] = map(ix, iy, 2*iz);
-              seq[2*iy+1] = map(ix, iy, 2*iz+1);
-            }
-            fft1d_y.transform(scitbx::fftpack::select_sign<
-              scitbx::fftpack::forward_tag>(), seq, scratch);
-            for (int iy = 0; iy < ny; iy++) {
-              map(ix, iy, 2*iz) = seq[2*iy];
-              map(ix, iy, 2*iz+1) = seq[2*iy+1];
-            }
-          }
-        }
-#if defined(_OPENMP)
-        #pragma omp for
-#endif
-        for (int iy = 0; iy < ny; iy++) {
-          if (!needed_y[iy]) continue;
-          for (int iz = 0; iz < nzc; iz++) {
-            for (int ix = 0; ix < nx; ix++) {
-              seq[2*ix] = map(ix, iy, 2*iz);
-              seq[2*ix+1] = map(ix, iy, 2*iz+1);
-            }
-            fft1d_x.transform(scitbx::fftpack::select_sign<
-              scitbx::fftpack::forward_tag>(), seq, scratch);
-            for (int ix = 0; ix < nx; ix++) {
-              map(ix, iy, 2*iz) = seq[2*ix];
-              map(ix, iy, 2*iz+1) = seq[2*ix+1];
-            }
-          }
-        }
-      }
-    }
   }
 
   versa_3d_padded_real_array
@@ -702,7 +633,7 @@ namespace mmtbx { namespace masks {
     std::vector<char> needed_y(ndim[1], 0);
     for(long k=-hmax[1]; k<=hmax[1]; ++k)
       needed_y[scitbx::math::mod_positive(k, long(ndim[1]))] = 1;
-    forward_in_asu_box(padded_real.ref(), nonzero_x, nonzero_y, needed_y,
+    fft.forward_pruned(padded_real.ref(), nonzero_x, nonzero_y, needed_y,
       hmax[2]+1);
     const padded_grid_t pad_complex( fft.n_complex(), fft.n_complex() );
     versa_3d_padded_complex_array result(padded_real.handle(), pad_complex );
